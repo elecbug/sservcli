@@ -23,6 +23,6 @@ popd
 exit /b 0
 :requirements
 echo Install Python 3.11 or newer with Tcl/Tk and the launcher from https://www.python.org/downloads/windows/
-echo Build.cmd installs Python SSH dependencies from binary wheels. Check the pip output if installation failed.
+echo Enable OpenSSH Client in Windows Optional Features. No pip packages or compilation are needed.
 popd
 exit /b 1

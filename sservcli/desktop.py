@@ -16,7 +16,7 @@ from .token_auth import remembered_token, store_token
 def quick_profile(host, fallback, port, user, identity, host_key, services):
     config = {"version": 2, "name": host.strip() or "My server", "ssh": {
         "host": host.strip(), "fallback_hosts": json.loads(fallback or "[]"), "port": int(port),
-        "host_public_key": host_key.strip()},
+        "user": user.strip() or "svc_tunnel", "host_public_key": host_key.strip()},
         "reconnect": {"enabled": True, "max_attempts": 5, "initial_delay_secs": 2, "max_delay_secs": 30},
         "services": services}
     validate_profile(config)
@@ -127,7 +127,7 @@ class Desktop:
         setup.columnconfigure(1, weight=1)
         self.fields = {}
         specifications = (("host", "Server IP / hostname", ""), ("fallback", "Alternative IPs (JSON array)", "[]"),
-                          ("port", "SSH port", "8022"), ("user", "SSH user", "svc_tunnel"),
+                          ("port", "SSH port", "22"), ("user", "SSH user", "svc_tunnel"),
                           ("identity", "Private key (blank = SSH Agent)", ""))
         self.legacy_widgets = []
         for row, (name, label, default) in enumerate(specifications):
@@ -136,7 +136,7 @@ class Desktop:
             self.fields[name] = tk.StringVar(value=default)
             entry = ttk.Entry(setup, textvariable=self.fields[name])
             entry.grid(row=row, column=1, sticky="ew", pady=4)
-            if name in ("user", "identity"):
+            if name == "identity":
                 self.legacy_widgets.extend((label_widget, entry))
         browse = ttk.Button(setup, text="Browse", command=self.choose_identity)
         browse.grid(row=4, column=2, padx=4)
@@ -199,7 +199,7 @@ class Desktop:
         for widget in self.legacy_widgets:
             widget.grid() if config["version"] == 1 else widget.grid_remove()
         for field, value in (("host", ssh["host"]), ("fallback", json.dumps(ssh.get("fallback_hosts", []))),
-                             ("port", ssh.get("port", 8022 if config["version"] == 2 else 22)), ("user", ssh.get("user", "sservcli")), ("identity", ssh.get("identity_file") or "")):
+                             ("port", ssh.get("port", 22)), ("user", ssh.get("user", "svc_tunnel")), ("identity", ssh.get("identity_file") or "")):
             self.fields[field].set(value)
         self.host_key.delete("1.0", "end")
         self.host_key.insert("1.0", ssh.get("host_public_key", ""))
@@ -219,7 +219,7 @@ class Desktop:
         self.disconnect()
         self.config = self.config_path = None
         self.profile_label.set("New connection")
-        for name, value in (("host", ""), ("fallback", "[]"), ("port", "8022"), ("user", "svc_tunnel"), ("identity", "")):
+        for name, value in (("host", ""), ("fallback", "[]"), ("port", "22"), ("user", "svc_tunnel"), ("identity", "")):
             self.fields[name].set(value)
         self.token.set("")
         self.key_help.set("The server bundle includes this public key. Login uses the startup token entered above.")
@@ -267,7 +267,7 @@ class Desktop:
                 config = copy.deepcopy(self.config)
                 ssh = config["ssh"]
                 ssh.update(host=self.fields["host"].get().strip(), fallback_hosts=json.loads(self.fields["fallback"].get()),
-                           port=int(self.fields["port"].get()))
+                           port=int(self.fields["port"].get()), user=self.fields["user"].get().strip())
                 if config["version"] == 1:
                     ssh.update(user=self.fields["user"].get().strip(), identity_file=self.fields["identity"].get().strip() or None)
                 key = self.host_key.get("1.0", "end").strip()

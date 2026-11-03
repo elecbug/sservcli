@@ -1,262 +1,83 @@
-"""Unprivileged SSH server accepting startup tokens and loopback forwards only."""
-from collections import OrderedDict, deque
-import hmac
-import ipaddress
-import logging
-import socket
+"""Unprivileged token controller for the system's existing OpenSSH daemon."""
+import json
+import os
+from pathlib import Path
+import subprocess
+import sys
 import threading
-import time
 
-import paramiko
+from .config import ConfigError, token_profile, validate_token
+from .token_auth import FileLock, private_directory, write_private
 
-from .config import ConfigError, token_profile
-from .relay import close_stream, relay
-from .token_auth import FileLock, generate_token, host_identity, private_directory, read_private, write_private
-
-logging.getLogger("sservcli.ssh").addHandler(logging.NullHandler())
-logging.getLogger("sservcli.ssh").propagate = False
-
-
-class TokenAuthority:
-    def __init__(self, token, *, window=60, per_ip=5, total=50, clock=time.monotonic):
-        self._token = token.encode("ascii")
-        self.window, self.per_ip, self.total, self.clock = window, per_ip, total, clock
-        self.failures = OrderedDict()
-        self.global_failures = deque()
-        self.lock = threading.Lock()
-
-    def _recent(self, peer):
-        cutoff = self.clock() - self.window
-        while self.global_failures and self.global_failures[0] <= cutoff:
-            self.global_failures.popleft()
-        failures = self.failures.setdefault(peer, deque())
-        self.failures.move_to_end(peer)
-        while failures and failures[0] <= cutoff:
-            failures.popleft()
-        while len(self.failures) > 4096:
-            self.failures.popitem(last=False)
-        return failures
-
-    def blocked(self, peer):
-        with self.lock:
-            failures = self._recent(peer)
-            return len(failures) >= self.per_ip or len(self.global_failures) >= self.total
-
-    def authenticate(self, peer, username, token):
-        with self.lock:
-            failures = self._recent(peer)
-            if len(failures) >= self.per_ip or len(self.global_failures) >= self.total:
-                return False
-            supplied = token.encode("utf-8") if isinstance(token, str) and len(token) <= 128 else b""
-            correct = hmac.compare_digest(self._token, supplied)
-            if correct and username == "sservcli":
-                return True
-            now = self.clock()
-            failures.append(now)
-            self.global_failures.append(now)
-            return False
-
-
-class ForwardingInterface(paramiko.ServerInterface):
-    def __init__(self, owner, peer):
-        self.owner, self.peer = owner, peer
-        self.authenticated = False
-        self.destinations = {}
-        self.lock = threading.Lock()
-        self.slots = threading.BoundedSemaphore(64)
-
-    def get_allowed_auths(self, username):
-        return "password"
-
-    def check_auth_password(self, username, password):
-        if self.owner.authority.authenticate(self.peer, username, password):
-            self.authenticated = True
-            with self.owner.lock:
-                self.owner.authentications += 1
-            return paramiko.AUTH_SUCCESSFUL
-        return paramiko.AUTH_FAILED
-
-    def check_channel_direct_tcpip_request(self, chanid, origin, destination):
-        if not self.authenticated or destination not in self.owner.allowed:
-            return paramiko.OPEN_FAILED_ADMINISTRATIVELY_PROHIBITED
-        if not self.slots.acquire(blocking=False):
-            return paramiko.OPEN_FAILED_RESOURCE_SHORTAGE
-        if not self.owner.channel_slots.acquire(blocking=False):
-            self.slots.release()
-            return paramiko.OPEN_FAILED_RESOURCE_SHORTAGE
-        with self.lock:
-            self.destinations[chanid] = destination
-        return paramiko.OPEN_SUCCEEDED
-
-    def check_global_request(self, kind, msg):
-        return self.authenticated and kind in ("keepalive@sservcli", "keepalive@openssh.com")
-
-    # All session, shell/exec/SFTP, remote forwarding, agent, X11, and unknown
-    # channel requests retain ServerInterface's rejecting defaults.
+ROOT = Path(__file__).resolve().parents[1]
 
 
 class TokenServer:
-    def __init__(self, config, state_dir, *, listen="0.0.0.0", port=None):
+    def __init__(self, config, state_dir, *, sshd_config="/etc/ssh/sshd_config", ssh_service="ssh",
+                 host_key="/etc/ssh/ssh_host_ed25519_key.pub"):
         self.profile = token_profile(config)
         self.state_dir = private_directory(state_dir)
-        self.host_key, self.public_key = host_identity(self.state_dir)
-        self.listen = str(ipaddress.ip_address(listen))
-        self.port = self.profile["ssh"].get("port", 8022) if port is None else port
-        self.allowed = {("127.0.0.1", service["remote_port"]) for service in self.profile["services"]}
+        self.sshd_config, self.ssh_service, self.host_key = sshd_config, ssh_service, host_key
         self.stopping = threading.Event()
-        self.lock = threading.Lock()
-        self.connections = set()
-        self.transports = set()
-        self.sessions = set()
-        self.connection_slots = threading.BoundedSemaphore(64)
-        self.channel_slots = threading.BoundedSemaphore(256)
-        self.listener = None
-        self.thread = None
-        self.state_lock = None
-        self.token = None
-        self.authentications = 0
-        self.address = None
+        self.process = self.state_lock = None
+        self.token = self.public_key = self.user = None
 
     def start(self):
-        if self.thread and self.thread.is_alive():
-            raise ConfigError("This server is already running")
-        self.state_lock = FileLock(self.state_dir / "server.lock")
+        if self.process:
+            raise ConfigError("Token controller is already running")
+        self.state_lock = FileLock(self.state_dir / "controller.lock")
         self.state_lock.__enter__()
         try:
-            self.listener = socket.socket(socket.AF_INET6 if ":" in self.listen else socket.AF_INET)
-            if hasattr(socket, "SO_EXCLUSIVEADDRUSE"):
-                self.listener.setsockopt(socket.SOL_SOCKET, socket.SO_EXCLUSIVEADDRUSE, 1)
-            else:
-                self.listener.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-            self.listener.bind((self.listen, self.port))
-            self.listener.listen(64)
-            self.listener.settimeout(0.3)
-            self.address = self.listener.getsockname()
-            previous = None
-            token_file = self.state_dir / "access.token"
-            if token_file.exists():
-                previous = read_private(token_file).strip()
-            self.token = generate_token(previous)
-            self.authority = TokenAuthority(self.token)
-            write_private(token_file, self.token + "\n")
-            self.thread = threading.Thread(target=self._accept, daemon=True)
-            self.thread.start()
+            policy = self.state_dir / "controller-profile.json"
+            write_private(policy, json.dumps(self.profile))
+            command = [sys.executable, str(ROOT / "server/sservcli_server.py"), "token-serve", "--config", str(policy),
+                       "--sshd-config", str(self.sshd_config), "--ssh-service", self.ssh_service,
+                       "--host-key", str(self.host_key), "--ensure-ssh"]
+            if os.name == "nt":
+                raise ConfigError("Run the server token controller on Ubuntu/OpenSSH")
+            if os.geteuid() != 0:
+                # Keep the caller's terminal/session so sudo -n can use the
+                # same timestamp as sudo -v. Its stdin remains the lifetime
+                # pipe; sudo never reads a password from that pipe.
+                subprocess.run(["sudo", "-v"], check=True)
+                command = ["sudo", "-n", *command]
+            self.process = subprocess.Popen(command, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                                            text=True, encoding="utf-8")
+            line = self.process.stdout.readline(32769)
+            if not line or len(line) > 32768 or not line.endswith("\n"):
+                raise ConfigError("OpenSSH account setup failed; see the administrator error above")
+            receipt = json.loads(line)
+            if not isinstance(receipt, dict) or not all(isinstance(receipt.get(field), str) for field in ("token", "user", "host_public_key", "requested_user")) or not isinstance(receipt.get("permitted"), list):
+                raise ConfigError("Invalid OpenSSH setup response")
+            self.token = validate_token(receipt["token"])
+            self.user, self.public_key = receipt["user"], receipt["host_public_key"]
+            if not isinstance(self.user, str) or not isinstance(self.public_key, str):
+                raise ConfigError("Invalid OpenSSH setup response")
+            self.profile["ssh"].update(user=self.user, host_public_key=self.public_key)
+            # Publish no credential in the metadata used for Windows packaging.
+            metadata = {"requested_user": receipt["requested_user"], "user": self.user,
+                        "host_public_key": self.public_key, "permitted": receipt["permitted"],
+                        "sshd_config": str(self.sshd_config)}
+            write_private(self.state_dir / "server.json", json.dumps(metadata, indent=2) + "\n")
+            write_private(self.state_dir / "access.token", self.token + "\n")
             return self
         except BaseException:
             self.close()
             raise
 
-    def _accept(self):
-        while not self.stopping.is_set():
-            try:
-                connection, address = self.listener.accept()
-            except socket.timeout:
-                continue
-            except OSError:
-                break
-            if self.authority.blocked(address[0]):
-                connection.close()
-                continue
-            if not self.connection_slots.acquire(blocking=False):
-                connection.close()
-                continue
-            worker = threading.Thread(target=self._session, args=(connection, address[0]), daemon=True)
-            with self.lock:
-                self.connections.add(connection)
-                self.sessions.add(worker)
-            worker.start()
-
-    def _session(self, connection, peer):
-        transport = None
-        interface = ForwardingInterface(self, peer)
-        stopping = threading.Event()
-        streams, workers = set(), set()
-        streams_lock = threading.Lock()
-        try:
-            transport = paramiko.Transport(connection)
-            transport.banner_timeout = transport.handshake_timeout = transport.auth_timeout = 10
-            transport.set_log_channel("sservcli.ssh.server")
-            transport.add_server_key(self.host_key)
-            with self.lock:
-                self.transports.add(transport)
-            transport.start_server(server=interface)
-            deadline = time.monotonic() + 10
-            while transport.is_active() and not self.stopping.is_set():
-                if not transport.is_authenticated() and time.monotonic() > deadline:
-                    break
-                channel = transport.accept(timeout=0.2)
-                if channel is None:
-                    continue
-                with interface.lock:
-                    destination = interface.destinations.pop(channel.get_id(), None)
-                if destination is None:
-                    channel.close()
-                    continue
-
-                def forward(channel=channel, destination=destination):
-                    upstream = None
-                    try:
-                        upstream = socket.create_connection(destination, timeout=5)
-                        upstream.settimeout(None)
-                        with streams_lock:
-                            streams.update((channel, upstream))
-                        relay(channel, upstream, stopping)
-                    except (OSError, EOFError):
-                        pass
-                    finally:
-                        close_stream(channel)
-                        if upstream:
-                            close_stream(upstream)
-                        with streams_lock:
-                            streams.discard(channel)
-                            streams.discard(upstream)
-                            workers.discard(threading.current_thread())
-                        interface.slots.release()
-                        self.channel_slots.release()
-
-                worker = threading.Thread(target=forward, daemon=True)
-                with streams_lock:
-                    workers.add(worker)
-                worker.start()
-        except (OSError, EOFError, paramiko.SSHException):
-            # Never echo authentication data or untrusted SSH protocol text.
-            pass
-        finally:
-            stopping.set()
-            if transport:
-                transport.close()
-            close_stream(connection)
-            with streams_lock:
-                active_streams, active_workers = list(streams), list(workers)
-            for stream in active_streams:
-                close_stream(stream)
-            for worker in active_workers:
-                worker.join(timeout=6)
-            with interface.lock:
-                for _ in interface.destinations:
-                    interface.slots.release()
-                    self.channel_slots.release()
-                interface.destinations.clear()
-            with self.lock:
-                self.connections.discard(connection)
-                self.transports.discard(transport)
-                self.sessions.discard(threading.current_thread())
-            self.connection_slots.release()
-
     def close(self):
         self.stopping.set()
-        if self.listener:
-            self.listener.close()
-        if self.thread:
-            self.thread.join(timeout=2)
-        with self.lock:
-            transports, connections, workers = list(self.transports), list(self.connections), list(self.sessions)
-        for transport in transports:
-            transport.close()
-        for connection in connections:
-            close_stream(connection)
-        for worker in workers:
-            worker.join(timeout=8)
-        if self.state_lock:
-            self.state_lock.__exit__(None, None, None)
-            self.state_lock = None
+        try:
+            if self.process:
+                process, self.process = self.process, None
+                if process.stdin:
+                    process.stdin.close()
+                result = process.wait(timeout=30)
+                if process.stdout:
+                    process.stdout.close()
+                if result:
+                    raise ConfigError("OpenSSH token setup/revocation failed; inspect the administrator error output")
+        finally:
+            if self.state_lock:
+                self.state_lock.__exit__(None, None, None)
+                self.state_lock = None

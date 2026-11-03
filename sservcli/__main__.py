@@ -35,11 +35,13 @@ def parser():
     sub.add_argument("--remote-port", type=int, default=8080)
     sub.add_argument("--local-port", type=int, default=18080)
     sub.add_argument("--config", type=Path, default=Path("services.json"))
-    sub = commands.add_parser("serve", help="Run the token-authenticated SSH forwarding server")
+    sub = commands.add_parser("serve", help="Issue a token password for a dedicated account on the existing OpenSSH server")
     sub.add_argument("--config", type=Path, default=Path("services.json"))
     sub.add_argument("--state-dir", type=Path, default=Path(os.environ.get("SERVER_STATE") or "var/server"))
-    sub.add_argument("--listen", default="0.0.0.0", help="Listening IP address; default: 0.0.0.0")
     sub.add_argument("--port", type=int, default=int(os.environ["TOKEN_PORT"]) if os.environ.get("TOKEN_PORT") else None)
+    sub.add_argument("--sshd-config", default=os.environ.get("SSHD_CONFIG") or "/etc/ssh/sshd_config")
+    sub.add_argument("--ssh-service", default=os.environ.get("SSH_SERVICE") or "ssh")
+    sub.add_argument("--host-key", default=os.environ.get("HOST_KEY_FILE") or "/etc/ssh/ssh_host_ed25519_key.pub")
     return result
 
 
@@ -123,7 +125,7 @@ def main(argv=None):
             config = resolved_profile(config, args.config)
             if args.command == "command":
                 if config["version"] == 2:
-                    raise ConfigError("Token profiles use the built-in SSH transport; run connect instead")
+                    raise ConfigError("Use connect for token profiles; it configures OpenSSH's private askpass helper")
                 if config["ssh"].get("host_public_key"):
                     raise ConfigError("Use connect for host_public_key profiles; it creates and cleans up the pinned key file")
                 argv = [openssh_program(), *ssh_arguments(config, config["ssh"]["known_hosts_file"])]
@@ -151,7 +153,8 @@ def main(argv=None):
 def serve(args):
     from .token_server import TokenServer
     config = token_profile(load_profile(args.config), args.port)
-    server = TokenServer(config, args.state_dir, listen=args.listen)
+    server = TokenServer(config, args.state_dir, sshd_config=args.sshd_config,
+                         ssh_service=args.ssh_service, host_key=args.host_key)
     stopping = False
 
     def stop(*_):
@@ -164,7 +167,9 @@ def serve(args):
     previous = {number: signal.signal(number, stop) for number in signals}
     try:
         server.start()
-        print(f"Token SSH server listening on {server.address[0]}:{server.address[1]}", flush=True)
+        if stopping:
+            return 0
+        print(f"OpenSSH token ready for {server.user}@{config['ssh']['host']}:{config['ssh'].get('port', 22)} (existing system sshd)", flush=True)
         if sys.stdout.isatty():
             print(f"Shared token: {server.token}", flush=True)
         else:
@@ -172,6 +177,8 @@ def serve(args):
         print(f"Server public key: {server.public_key}", flush=True)
         print(f"Token file: {server.state_dir / 'access.token'}\nStop with Ctrl+C. Restarting issues a new token and closes existing connections.", flush=True)
         while not stopping:
+            if server.process.poll() is not None:
+                raise ConfigError("The OpenSSH token manager stopped; its token was revoked")
             server.stopping.wait(0.2)
         return 0
     finally:

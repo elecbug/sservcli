@@ -19,7 +19,7 @@ if errorlevel 1 goto requirements
 popd
 exit /b 0
 :requirements
-echo Run Build.cmd once to install the Python SSH dependencies. Python with Tcl/Tk is required.
+echo Run Build.cmd to check Python, Tcl/Tk, and Windows OpenSSH Client.
 pause
 popd
 exit /b 1

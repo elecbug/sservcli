@@ -14,10 +14,11 @@ def check_runtime():
         import _tkinter
     except ImportError as error:
         raise RuntimeError("Install Python with Tcl/Tk enabled; tkinter is required for the desktop") from error
-    try:
-        import paramiko
-    except ImportError as error:
-        raise RuntimeError("Run Build.cmd once to install the Python SSH dependencies") from error
+    from .tunnel import openssh_program, process_options
+    for name in ("ssh", "ssh-keygen"):
+        program = openssh_program(name)
+        if name == "ssh":
+            subprocess.run([program, "-V"], check=True, capture_output=True, timeout=10, **process_options())
     return True
 
 
@@ -28,15 +29,8 @@ def environment_python():
 
 
 def setup_runtime():
-    if sys.version_info < (3, 11):
-        raise RuntimeError("Install Python 3.11 or newer with Tcl/Tk")
-    root = Path(__file__).resolve().parents[1]
-    python = environment_python()
-    if not python.is_file():
-        subprocess.run([sys.executable, "-m", "venv", str(root / ".venv")], check=True)
-    subprocess.run([str(python), "-m", "pip", "--disable-pip-version-check", "install", "--only-binary=:all:",
-                    "-r", str(root / "requirements.txt")], check=True)
-    subprocess.run([str(python), "-m", "sservcli.windows_launcher", "--check"], cwd=root, check=True)
+    check_runtime()
+    print("Ready. Python, Tkinter, and native OpenSSH are available. No Python packages need installation.")
 
 
 def main(argv=None):
@@ -57,7 +51,7 @@ def main(argv=None):
             return 0
         check_runtime()
         if not args.start:
-            print("Ready. Python, Tkinter, and the SSH library are available. Run Start.cmd; native compilation is not required.")
+            print("Ready. Python, Tkinter, and native OpenSSH are available. Run Start.cmd; native compilation is not required.")
             return 0
         from .instance import state_directory
         executable = Path(sys.executable)

@@ -1,5 +1,4 @@
-"""Server tokens, persistent host identity, and local secret storage."""
-import base64
+"""Eight-character tokens and local secret storage; SSH uses system OpenSSH."""
 import contextlib
 import hashlib
 import os
@@ -93,37 +92,10 @@ class FileLock:
             self.file = None
 
 
-def host_identity(directory):
-    import io
-    import paramiko
-    from cryptography.hazmat.primitives.asymmetric import ed25519
-    from cryptography.hazmat.primitives import serialization
-    directory = private_directory(directory)
-    with FileLock(directory / "host-key.lock"):
-        path = directory / "host_ed25519"
-        if not os.path.lexists(path):
-            key = ed25519.Ed25519PrivateKey.generate()
-            data = key.private_bytes(serialization.Encoding.PEM, serialization.PrivateFormat.OpenSSH, serialization.NoEncryption())
-            write_private(path, data.decode("ascii"))
-        key = paramiko.Ed25519Key.from_private_key(io.StringIO(read_private(path)))
-        public = f"{key.get_name()} {key.get_base64()}"
-        write_private(directory / "host_ed25519.pub", public + "\n")
-        return key, public
-
-
-def public_key(text):
-    import paramiko
-    try:
-        kind, encoded = text.split()[:2]
-        return paramiko.PKey.from_type_string(kind, base64.b64decode(encoded, validate=True))
-    except (ValueError, TypeError, IndexError, paramiko.SSHException) as error:
-        raise ConfigError("Invalid pinned server public key") from error
-
-
 def token_slot(config):
     ssh = config["ssh"]
     identity = " ".join(ssh.get("host_public_key", "").split()[:2])
-    return hashlib.sha256(f"{identity}:{ssh.get('port', 8022)}".encode()).hexdigest()
+    return hashlib.sha256(f"{identity}:{ssh.get('port', 22)}".encode()).hexdigest()
 
 
 def store_token(directory, config, token):

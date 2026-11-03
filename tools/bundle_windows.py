@@ -1,8 +1,9 @@
 #!/usr/bin/env python3
 """Prepare a Python Windows client ZIP and provision a forwarding account locally.
 
-Existing client private keys stay on Windows. This tool registers only the supplied
-client public key and embeds only the server's public host key in the bundle.
+Token mode prepares a restricted system OpenSSH account and embeds its public
+host key. The optional legacy mode registers an existing client public key.
+Neither private keys nor shared tokens enter the bundle.
 """
 import argparse
 import hashlib
@@ -39,11 +40,11 @@ def run(argv, *, timeout=3600):
 
 def source_files(root=ROOT):
     """Explicit runtime allowlist: never walk arbitrary directories or key files."""
-    required = ["Build.cmd", "Start.cmd", "README.md", "requirements.txt", "examples/services.json", "examples/services.windows.json",
+    required = ["Build.cmd", "Start.cmd", "README.md", "requirements.txt",
                 "examples/services.token.json", "examples/services.token.windows.json"]
     required += [f"sservcli/{name}.py" for name in (
         "__init__", "__main__", "config", "tunnel", "desktop", "instance", "windows", "windows_launcher",
-        "token_auth", "token_server", "token_tunnel", "relay")]
+        "token_auth", "token_server", "askpass")]
     files = {}
     for name in required:
         path = root / name
@@ -83,8 +84,8 @@ def client_archive(config, inputs):
     files = {**inputs, "services.json": (json.dumps(config, indent=2) + "\n").encode(),
              "README.txt": ("sservcli Python Windows client\r\n\r\n"
                 "Extract the entire ZIP under your Windows user account.\r\n"
-                "Install Python 3.11+ with Tcl/Tk and the Python launcher.\r\n"
-                "Run Build.cmd once to install Python SSH dependencies from binary wheels, then run Start.cmd.\r\n"
+                "Install Python 3.11+ with Tcl/Tk and the Python launcher, and enable Windows OpenSSH Client.\r\n"
+                "Run Build.cmd to check prerequisites, then run Start.cmd. No pip dependencies or compilation are needed.\r\n"
                 + ("Enter the current case-sensitive 8-character token shown by make server. It is not included in this ZIP.\r\n" if config["version"] == 2 else
                    "This is a legacy SSH-key profile: enable OpenSSH Client and use the authorized private key/Agent.\r\n") +
                 "All enabled services connect automatically. Click the tray icon to show services. Tray > Quit stops SSH.\r\n"
@@ -99,7 +100,9 @@ def client_archive(config, inputs):
 def server_command(args, operation, profile=None):
     command = [sys.executable, ROOT / "server/sservcli_server.py", operation,
                "--sshd-config", args.sshd_config, "--ssh-service", args.ssh_service]
-    if operation == "ensure":
+    if operation == "token-prepare":
+        command += ["--config", profile, "--host-key", args.host_key, "--ensure-ssh"]
+    elif operation == "ensure":
         command += ["--config", profile, "--public-key", args.public_key, "--ensure-ssh"]
     else:
         command += ["--user", args.user]
@@ -128,11 +131,11 @@ def profile_for(args):
 
 def package(args):
     if not args.config.is_file():
-        raise BundleError("Set CONFIG to an existing services JSON (copy and edit examples/services.json)")
+        raise BundleError("Set CONFIG to an existing services JSON (copy and edit examples/services.token.json)")
     if not args.client_only and not args.legacy_ssh:
         return package_token(args)
     if args.legacy_ssh and server is None:
-        raise BundleError("Legacy account provisioning requires Ubuntu; token mode does not require OS accounts")
+        raise BundleError("Account provisioning requires Ubuntu/OpenSSH; use --client-only to repackage a final profile elsewhere")
     if not args.client_only and (not args.public_key or not args.public_key.is_file()):
         raise BundleError("Set PUBKEY_FILE to the existing Windows client's Ed25519 PUBLIC key; private keys are never packaged")
     if args.client_only:
@@ -202,19 +205,23 @@ def package_token(args):
     inputs = source_files()
     output = (args.output or ROOT / "dist/sservcli-windows-token.zip").absolute()
     if args.dry_run:
-        print("Dry run: token-server client inputs validated. Would prepare the persistent server host identity in", args.state_dir)
-        print("Would publish:", output, "(numeric suffix if it exists). No account, key registration, or shared token is needed for packaging.")
+        print("Dry run: would create/reuse a restricted OpenSSH password account and pin the existing sshd public host key.")
+        print("Would publish:", output, "(numeric suffix if it exists). No shared token is issued or packaged.")
         return None
-    try:
-        from sservcli.token_auth import host_identity
-        _, public = host_identity(args.state_dir)
-    except ImportError as error:
-        raise BundleError("Run make setup to install Python SSH dependencies") from error
-    config["ssh"]["host_public_key"] = public
+    if server is None:
+        raise BundleError("Prepare the server account on Ubuntu/OpenSSH; use --client-only to repackage a final client profile elsewhere")
     output.parent.mkdir(parents=True, exist_ok=True)
     with tempfile.TemporaryDirectory(prefix=".sservcli-token-bundle-", dir=output.parent) as directory:
+        profile_path = Path(directory) / "policy.json"
+        profile_path.write_text(json.dumps(config), encoding="utf-8")
+        receipt = json.loads(run(server_command(args, "token-prepare", profile_path)))
+        if not isinstance(receipt, dict) or not isinstance(receipt.get("user"), str) or not isinstance(receipt.get("host_public_key"), str):
+            raise BundleError("Invalid OpenSSH preparation response")
+        server.username(receipt["user"])
+        config["ssh"].update(user=receipt["user"], host_public_key=receipt["host_public_key"])
+        validate_profile(config)
         output = write_archive(output, client_archive(config, inputs), directory)
-    print(f"Token client ZIP ready: {output}\nRun Build.cmd once, then Start.cmd on Windows. Enter the 8-character token printed by make server. The token was not packaged.")
+    print(f"OpenSSH token client ZIP ready: {output}\nRun Start.cmd on Windows and enter the 8-character token printed by make server. The token was not packaged.")
     return output
 
 

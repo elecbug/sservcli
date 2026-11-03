@@ -71,12 +71,15 @@ def prepare_host_key(ssh, directory):
 def ssh_arguments(config, known_hosts, host=None, control=None):
     ssh = config["ssh"]
     args = ["-F", "none", "-N", "-T", "-n"]
-    options = ["BatchMode=yes", "StrictHostKeyChecking=yes", "GlobalKnownHostsFile=none",
+    token_mode = config["version"] == 2
+    options = ["StrictHostKeyChecking=yes", "GlobalKnownHostsFile=none",
                "UpdateHostKeys=no", "ExitOnForwardFailure=yes", "ServerAliveInterval=20",
                "ServerAliveCountMax=3", "ConnectTimeout=10", "ConnectionAttempts=1",
-               "PreferredAuthentications=publickey", "PasswordAuthentication=no",
                "KbdInteractiveAuthentication=no", "ForwardAgent=no", "ForwardX11=no",
                "GatewayPorts=no", "LogLevel=VERBOSE", f'UserKnownHostsFile="{ssh_path(known_hosts)}"']
+    options += (["BatchMode=no", "PreferredAuthentications=password", "PasswordAuthentication=yes",
+                 "PubkeyAuthentication=no", "NumberOfPasswordPrompts=1"] if token_mode else
+                ["BatchMode=yes", "PreferredAuthentications=publickey", "PasswordAuthentication=no"])
     if os.name != "nt":
         options.append("ControlPersist=no")
         if control:
@@ -86,7 +89,7 @@ def ssh_arguments(config, known_hosts, host=None, control=None):
         args += ["-i", ssh_path(ssh["identity_file"])]
     for option in options:
         args += ["-o", option]
-    args += ["-p", str(ssh.get("port", 22)), "-l", ssh["user"]]
+    args += ["-p", str(ssh.get("port", 22)), "-l", ssh.get("user", "svc_tunnel")]
     for service in config["services"]:
         if service.get("enabled", True):
             args += ["-L", f"127.0.0.1:{service['local_port']}:127.0.0.1:{service['remote_port']}"]
@@ -124,7 +127,6 @@ class Tunnel:
         self.events = queue.Queue()
         self._stop = threading.Event()
         self._worker = None
-        self._cancel = None
 
     def snapshot(self):
         with self._lock:
@@ -146,14 +148,8 @@ class Tunnel:
             validate_token(token)
             if not config["ssh"].get("host_public_key"):
                 raise ConfigError("Import the server's client bundle or supply its public host key before connecting")
-            try:
-                from .token_tunnel import supervise
-                from .token_auth import public_key
-                public_key(config["ssh"]["host_public_key"])
-            except ImportError as error:
-                raise ConfigError("Install Python dependencies with make setup or Build.cmd") from error
-        else:
-            openssh_program()
+        openssh_program()
+        if not token_mode:
             for field in ("known_hosts_file", "identity_file"):
                 if config["ssh"].get(field) and not Path(config["ssh"][field]).is_file():
                     raise ConfigError(f"{field} does not exist: {config['ssh'][field]}")
@@ -163,16 +159,11 @@ class Tunnel:
             self._logs.clear()
             self._state["host_key_fingerprint"] = None
         self._update("connecting", "Preparing SSH connection")
-        target = supervise if token_mode else self._supervise
-        arguments = (self, copy.deepcopy(config), token) if token_mode else (copy.deepcopy(config),)
-        self._worker = threading.Thread(target=target, args=arguments, daemon=True)
+        self._worker = threading.Thread(target=self._supervise, args=(copy.deepcopy(config), token), daemon=True)
         self._worker.start()
 
     def disconnect(self):
         self._stop.set()
-        cancel = self._cancel
-        if cancel:
-            cancel()
         if self._worker:
             self._worker.join(timeout=15)
             if self._worker.is_alive():
@@ -181,7 +172,7 @@ class Tunnel:
         if self.snapshot()["status"] != "disconnected":
             self._update("disconnected", "SSH connection closed; local listeners released")
 
-    def _supervise(self, config):
+    def _supervise(self, config, token=None):
         try:
             # Unix socket paths must remain short even when the user's temp path is long.
             with tempfile.TemporaryDirectory(prefix=f"sservcli-{os.getpid()}-", dir=None if os.name == "nt" else "/tmp") as directory:
@@ -191,11 +182,15 @@ class Tunnel:
                 if fingerprint:
                     self.events.put(("pinned host key", fingerprint))
                 control = str(Path(directory) / "ctl") if os.name != "nt" else None
-                self._cycles(config, known, control)
+                environment = None
+                if token is not None:
+                    from .askpass import environment as askpass_environment
+                    environment = askpass_environment(token, directory)
+                self._cycles(config, known, control, environment, token)
         except Exception as error:
-            self._update("failed", str(error))
+            self._update("failed", str(error).replace(token, "[redacted]") if token else str(error))
 
-    def _cycles(self, config, known, control, connection=None):
+    def _cycles(self, config, known, control, environment=None, token=None):
         hosts = [config["ssh"]["host"], *config["ssh"].get("fallback_hosts", [])]
         reconnect = config.get("reconnect", {})
         maximum = reconnect.get("max_attempts", 5)
@@ -207,10 +202,10 @@ class Tunnel:
                     break
                 index = (first + offset) % len(hosts)
                 host = hosts[index]
-                self._update("connecting", f"Connecting to {host}:{config['ssh'].get('port', 8022 if config['version'] == 2 else 22)} (address {offset + 1}/{len(hosts)})", retries)
+                self._update("connecting", f"Connecting to {host}:{config['ssh'].get('port', 22)} (address {offset + 1}/{len(hosts)})", retries)
                 if control:
                     Path(control).unlink(missing_ok=True)
-                was_connected, message, fatal = (connection or self._connection)(config, known, host, control, retries)
+                was_connected, message, fatal = self._connection(config, known, host, control, retries, environment, token)
                 if fatal:
                     self._update("failed", message, retries)
                     return
@@ -229,7 +224,7 @@ class Tunnel:
                 break
         self._update("disconnected", "SSH connection closed; local listeners released", retries)
 
-    def _connection(self, config, known, host, control, attempt):
+    def _connection(self, config, known, host, control, attempt, environment=None, token=None):
         child = None
         reader = None
         job = None
@@ -238,7 +233,7 @@ class Tunnel:
         try:
             child = subprocess.Popen([openssh_program(), *ssh_arguments(config, known, host, control)],
                                      stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE,
-                                     start_new_session=os.name != "nt", **process_options())
+                                     start_new_session=os.name != "nt", env=environment, **process_options())
             if os.name == "nt":
                 from .windows import ChildJob
                 job = ChildJob(child)
@@ -246,6 +241,8 @@ class Tunnel:
             def drain():
                 while data := child.stderr.readline(4096):
                     line = "".join(c for c in data.decode("utf-8", "replace").rstrip() if c.isprintable())
+                    if token:
+                        line = line.replace(token, "[redacted]")
                     lines.append(line)
                     with self._lock:
                         self._logs.append(line)
@@ -257,6 +254,8 @@ class Tunnel:
                 if child.poll() is not None:
                     reader.join(timeout=2)
                     fatal = any(token in line for line in lines for token in ("HOST IDENTIFICATION HAS CHANGED", "Host key verification failed", "Permission denied"))
+                    if config["version"] == 2 and any("Permission denied" in line for line in lines):
+                        return connected, "Shared token rejected. Enter the current case-sensitive 8-character token.", True
                     return connected, f"{host}: SSH exited with {child.returncode}; see connection log", fatal
                 if not connected and self._ready(child, host, control, config):
                     connected = True

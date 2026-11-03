@@ -11,6 +11,7 @@ import tempfile
 import unittest
 from unittest.mock import patch
 
+from profiles import key_profile
 from sservcli.config import ConfigError, launch_arguments, load_profile, resolved_profile, save_profile, validate_profile
 from sservcli.instance import Instance
 from sservcli.tunnel import Tunnel, check_ports, launch_service, prepare_host_key, ssh_arguments
@@ -20,7 +21,7 @@ ROOT = Path(__file__).resolve().parents[1]
 
 class ClientTests(unittest.TestCase):
     def setUp(self):
-        self.config = json.loads((ROOT / "examples/services.json").read_text())
+        self.config = key_profile()
         self.temp = tempfile.TemporaryDirectory()
         self.addCleanup(self.temp.cleanup)
         self.directory = Path(self.temp.name)
@@ -33,7 +34,7 @@ class ClientTests(unittest.TestCase):
         self.assertIn("http://127.0.0.1:18080/", output)
         self.assertIn("disabled", output)
         self.assertIn("127.0.0.1:15432", output)
-        validate_profile(load_profile(ROOT / "examples/services.windows.json"))
+        validate_profile(key_profile(windows=True))
 
     def test_strict_validation_rejects_unknown_fields_and_unsafe_values(self):
         changes = [lambda c: c["ssh"].update(port=True), lambda c: c.update(version=True),

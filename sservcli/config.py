@@ -32,7 +32,7 @@ def validate_profile(config):
         raise ConfigError("Profile name must contain 1-128 UTF-8 bytes")
     ssh = config["ssh"]
     token_mode = config["version"] == 2
-    fields(ssh, ("host", "fallback_hosts", "port", "host_public_key") if token_mode else
+    fields(ssh, ("host", "fallback_hosts", "port", "user", "host_public_key") if token_mode else
            ("host", "fallback_hosts", "port", "user", "identity_file", "known_hosts_file", "host_public_key"),
            ("host",) if token_mode else ("host", "user"), "ssh")
     fallback = ssh.get("fallback_hosts", [])
@@ -43,9 +43,10 @@ def validate_profile(config):
         raise ConfigError("Configure at most 16 valid SSH hostnames/IPs")
     if len(set(host.lower() for host in hosts)) != len(hosts):
         raise ConfigError("SSH addresses must be unique")
-    if not token_mode and (not isinstance(ssh["user"], str) or not identifier.fullmatch(ssh["user"]) or ssh["user"].startswith("-")):
+    user = ssh.get("user", "svc_tunnel")
+    if not isinstance(user, str) or not identifier.fullmatch(user) or user.startswith("-"):
         raise ConfigError("Invalid SSH username")
-    number(ssh.get("port", 8022 if token_mode else 22), 1, 65535, "ssh.port")
+    number(ssh.get("port", 22), 1, 65535, "ssh.port")
     if ssh.get("identity_file") is not None:
         path(ssh["identity_file"])
     if not token_mode and (ssh.get("host_public_key") is None) == (ssh.get("known_hosts_file") is None):
@@ -153,13 +154,13 @@ def launch_arguments(service):
 
 
 def token_profile(config, port=None):
-    """Upgrade server/bundle inputs without carrying old OS login credentials."""
+    """Select token authentication while retaining the existing OpenSSH endpoint."""
     validate_profile(config)
     result = copy.deepcopy(config)
     ssh = config["ssh"]
     result["ssh"] = {"host": ssh["host"], "fallback_hosts": ssh.get("fallback_hosts", []),
-                     "port": port if port is not None else ssh.get("port", 8022) if config["version"] == 2 else 8022}
-    if config["version"] == 2 and ssh.get("host_public_key"):
+                     "port": port if port is not None else ssh.get("port", 22), "user": ssh.get("user", "svc_tunnel")}
+    if ssh.get("host_public_key"):
         result["ssh"]["host_public_key"] = ssh["host_public_key"]
     result["version"] = 2
     validate_profile(result)

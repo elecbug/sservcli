@@ -4,9 +4,14 @@ import json
 from pathlib import Path
 import shutil
 import tempfile
+import io
+import contextlib
+import builtins
 from types import SimpleNamespace
 import unittest
 from unittest.mock import patch
+
+from profiles import key_profile
 
 ROOT = Path(__file__).resolve().parents[1]
 spec = importlib.util.spec_from_file_location("server", ROOT / "server/sservcli_server.py")
@@ -16,8 +21,11 @@ spec.loader.exec_module(server)
 
 class PolicyTests(unittest.TestCase):
     def test_profile_and_restrictions(self):
-        args = argparse.Namespace(config=ROOT / "examples/services.json", user=None, permit_open=None)
-        user, permitted = server.policy_input(args)
+        with tempfile.TemporaryDirectory() as temporary:
+            path = Path(temporary) / "profile.json"
+            path.write_text(json.dumps(key_profile()))
+            args = argparse.Namespace(config=path, user=None, permit_open=None)
+            user, permitted = server.policy_input(args)
         text = server.policy(user, permitted)
         self.assertEqual(user, "svc_tunnel")
         self.assertIn("    MaxSessions 0\n", text)
@@ -48,6 +56,20 @@ class PolicyTests(unittest.TestCase):
         for invalid in (text + text, text.replace("Match all\n", ""), text.replace("# END", "# EDITED")):
             with self.assertRaises(server.SetupError):
                 server.managed_block(invalid, "svc_tunnel")
+
+    def test_bundle_host_key_must_belong_to_the_existing_sshd(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            directory = Path(temporary)
+            public = directory / "system_host.pub"
+            public.write_text("ssh-ed25519 AAAA system\n")
+            other = directory / "old_python_host.pub"
+            other.write_text("ssh-ed25519 BBBB old\n")
+            provisioner = SimpleNamespace(sshd="sshd", config=directory / "sshd_config")
+            effective = SimpleNamespace(stdout=f"hostkey {directory / 'system_host'}\n")
+            with patch.object(server, "run", return_value=effective):
+                self.assertEqual(server.host_public_key(public, provisioner), "ssh-ed25519 AAAA")
+                with self.assertRaisesRegex(server.SetupError, "does not match a HostKey"):
+                    server.host_public_key(other, provisioner)
 
     def test_key_merge_matches_identity_without_comment_and_preserves_other_entries(self):
         with patch.object(server, "run"):
@@ -310,6 +332,89 @@ class TransactionTests(unittest.TestCase):
             self.install()
         self.assertIn("svc_tunnel", self.accounts)
         self.assertFalse(any(command[0] == "userdel" for command in self.commands))
+
+    def test_native_token_policy_keeps_forwarding_only_and_limits_authentication_attempts(self):
+        options = server.policy_options("svc_tunnel", ["127.0.0.1:8080"], "token")
+        self.assertEqual(options["AuthenticationMethods"], "password")
+        self.assertEqual(options["PasswordAuthentication"], "yes")
+        self.assertEqual(options["PubkeyAuthentication"], "no")
+        self.assertEqual(options["AuthorizedKeysFile"], "none")
+        self.assertEqual(options["MaxAuthTries"], "3")
+        self.assertEqual(options["MaxSessions"], "0")
+        self.assertEqual(options["AllowTcpForwarding"], "local")
+        self.assertEqual(options["PermitListen"], "none")
+
+    def test_token_account_is_created_locked_and_reused_without_changing_its_identity(self):
+        user = self.p.resolve_token_user("svc_tunnel")
+        first = self.p.ensure_token(user, ["127.0.0.1:8080"])
+        second = self.p.ensure_token(user, ["127.0.0.1:8080"])
+        self.assertTrue(first["created"])
+        self.assertFalse(second["created"])
+        self.assertEqual(first["uid"], second["uid"])
+        self.assertEqual(sum(command[0] == "useradd" for command in self.commands), 1)
+        self.assertEqual(sum(command[0] == "usermod" for command in self.commands), 1)
+        self.assertEqual(json.loads(self.p.state_path(user).read_text())["auth_mode"], "token")
+        self.audit.assert_called_with(user, ["127.0.0.1:8080"], "token")
+
+    def test_migrating_a_managed_key_account_preserves_key_files_and_uid(self):
+        self.install()
+        key = self.p.home_base / "svc_tunnel/.ssh/authorized_keys"
+        before = key.read_bytes()
+        uid = self.accounts["svc_tunnel"].pw_uid
+        result = self.p.ensure_token("svc_tunnel", ["127.0.0.1:9000"])
+        self.assertFalse(result["created"])
+        self.assertEqual(result["uid"], uid)
+        self.assertEqual(key.read_bytes(), before)
+        self.assertIn("    AuthenticationMethods password\n", self.p.config.read_text())
+        self.assertIn("    PermitOpen 127.0.0.1:8080 127.0.0.1:9000\n", self.p.config.read_text())
+        with self.assertRaisesRegex(server.SetupError, "uses SSH token passwords"):
+            self.p.bind_key("svc_tunnel", ["127.0.0.1:8080"], self.key)
+
+    def test_external_existing_user_is_untouched_and_a_dedicated_name_is_selected(self):
+        self.accounts["existing"] = SimpleNamespace(pw_uid=9000, pw_dir="/home/existing", pw_shell="/bin/bash")
+        name = self.p.resolve_token_user("existing")
+        self.assertEqual(name, "existing_token1")
+        self.p.ensure_token(name, ["127.0.0.1:8080"])
+        self.assertEqual(self.accounts["existing"].pw_shell, "/bin/bash")
+        self.assertFalse(any(command[0] == "usermod" and command[-1] == "existing" for command in self.commands))
+        self.assertEqual(self.p.resolve_token_user("existing"), name)
+
+    def test_password_is_sent_only_on_chpasswd_stdin_and_requires_token_mode(self):
+        self.p.ensure_token("svc_tunnel", ["127.0.0.1:8080"])
+        with patch.object(server.subprocess, "run", return_value=SimpleNamespace(returncode=0)) as run:
+            self.p.set_token("svc_tunnel", "Ab1Cd2E3")
+            self.assertEqual(run.call_args.args[0], ["chpasswd"])
+            self.assertEqual(run.call_args.kwargs["input"], "svc_tunnel:Ab1Cd2E3\n")
+        with patch.object(server.subprocess, "run", return_value=SimpleNamespace(returncode=1)):
+            with self.assertRaisesRegex(server.SetupError, "password policy"):
+                self.p.set_token("svc_tunnel", "Ab1Cd2E3")
+
+    def test_failed_token_migration_restores_managed_account_and_key_policy(self):
+        self.install()
+        before = self.p.config.read_bytes(), self.p.state_path("svc_tunnel").read_bytes()
+        self.audit.side_effect = server.SetupError("fixture native SSH policy conflict")
+        with self.assertRaisesRegex(server.SetupError, "policy conflict"):
+            self.p.ensure_token("svc_tunnel", ["127.0.0.1:8080"])
+        self.assertEqual(before, (self.p.config.read_bytes(), self.p.state_path("svc_tunnel").read_bytes()))
+        self.assertIn("svc_tunnel", self.accounts)
+        self.assertFalse(any(command[0] == "userdel" for command in self.commands))
+
+    def test_token_lease_revokes_password_and_sessions_on_control_pipe_eof(self):
+        args = SimpleNamespace(command="token-serve", ensure_ssh=False, host_key="ignored.pub")
+        output = io.StringIO()
+        lock_path = self.p.home_base.parent / "token-lifetime.lock"
+        with (patch.object(server, "management_lock", side_effect=contextlib.nullcontext),
+              patch.object(server, "host_public_key", return_value="ssh-ed25519 public"),
+              patch.object(server, "open", side_effect=lambda *a, **kw: builtins.open(lock_path, "a"), create=True),
+              patch.object(server.sys, "stdin", io.StringIO("")),
+              patch.object(self.p, "set_token") as password,
+              contextlib.redirect_stdout(output)):
+            server.token_command(args, self.p, "svc_tunnel", ["127.0.0.1:8080"])
+        receipt = json.loads(output.getvalue())
+        self.assertRegex(receipt["token"], r"\A[A-Za-z0-9]{8}\Z")
+        password.assert_called_once_with("svc_tunnel", receipt["token"])
+        self.assertEqual(self.commands[-2:], [["usermod", "--lock", "svc_tunnel"], ["pkill", "-KILL", "-u", str(receipt["uid"])]])
+        self.assertNotIn(receipt["token"], self.p.state_path("svc_tunnel").read_text())
 
 
 if __name__ == "__main__":

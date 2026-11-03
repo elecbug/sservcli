@@ -14,6 +14,9 @@ import stat
 import subprocess
 import sys
 import tempfile
+import secrets
+import signal
+import string
 
 
 class SetupError(Exception):
@@ -68,9 +71,9 @@ def policy_input(args):
         if args.user is not None or args.permit_open is not None:
             raise SetupError("Use --config or --user/--permit-open, not both")
         config = json.loads(Path(args.config).read_text())
-        if type(config.get("version")) is not int or config["version"] != 1:
-            raise SetupError("Only configuration version 1 is supported")
-        user = config["ssh"]["user"]
+        if type(config.get("version")) is not int or config["version"] not in (1, 2):
+            raise SetupError("Only configuration versions 1 and 2 are supported")
+        user = config["ssh"].get("user", "svc_tunnel")
         # Include disabled services: enabled is a client preference, not authorization.
         values = []
         for service in config["services"]:
@@ -87,10 +90,18 @@ def markers(user):
     return f"# BEGIN sservcli {user}", f"# END sservcli {user}"
 
 
-def policy(user, permitted):
-    begin, end = markers(user)
+def policy_options(user, permitted, mode="key"):
     options = {**POLICY, "PermitOpen": " ".join(permitted),
                "AuthorizedKeysFile": f"/home/{user}/.ssh/authorized_keys"}
+    if mode == "token":
+        options.update(AuthenticationMethods="password", PubkeyAuthentication="no", PasswordAuthentication="yes",
+                       AuthorizedKeysFile="none", MaxAuthTries="3")
+    return options
+
+
+def policy(user, permitted, mode="key"):
+    begin, end = markers(user)
+    options = policy_options(user, permitted, mode)
     return (f"{begin}\nMatch User {user}\n" +
             "".join(f"    {key} {value}\n" for key, value in options.items()) +
             f"{end}\nMatch all\n")
@@ -211,12 +222,11 @@ class Provisioner:
     def syntax(self):
         run([self.sshd, "-t", "-f", str(self.config)])
 
-    def audit(self, user, permitted):
+    def audit(self, user, permitted, mode="key"):
         self.syntax()
         result = run([self.sshd, "-T", "-f", str(self.config), "-C", f"user={user},{self.context}"])
         effective = dict(line.split(" ", 1) for line in result.stdout.splitlines() if " " in line)
-        expected = {**POLICY, "PermitOpen": " ".join(permitted),
-                    "AuthorizedKeysFile": f"/home/{user}/.ssh/authorized_keys"}
+        expected = policy_options(user, permitted, mode)
         for key, value in expected.items():
             actual = effective.get(key.lower())
             if actual != value:
@@ -273,6 +283,113 @@ class Provisioner:
         key_status = self.bind_key(user, permitted, key_path)
         return {"user": user, "created": False, "account": "reused", "key": key_status}
 
+    def resolve_token_user(self, preferred):
+        """Reuse managed accounts; leave unrelated accounts and homes untouched."""
+        ensure_state_dir(self.state_dir)
+        for index in range(100):
+            user = preferred if index == 0 else preferred[:22] + f"_token{index}"
+            entry = account(user)
+            recorded = os.path.lexists(self.state_path(user))
+            if entry and recorded:
+                self.managed_identity(user)
+                return user
+            if not entry and not recorded and not os.path.lexists(self.home_base / user):
+                return user
+        raise SetupError("Could not select an unused dedicated SSH token account")
+
+    def managed_identity(self, user):
+        safe_directory(self.state_dir)
+        path = self.state_path(user)
+        safe_file(path)
+        record = json.loads(path.read_text())
+        safe_file(self.config)
+        block = managed_block(self.config.read_text(), user)[0]
+        entry = account(user)
+        if (record["user"] != user or record["sshd_config"] != str(self.config.resolve())
+                or hashlib.sha256(block.encode()).hexdigest() != record["block_sha256"]):
+            raise SetupError("Managed account/configuration metadata differs")
+        if (not entry or entry.pw_uid == 0 or entry.pw_uid != record["uid"] or entry.pw_dir != record["home"]
+                or record["home"] != str(self.home_base / user) or entry.pw_shell != "/usr/sbin/nologin"):
+            raise SetupError("Managed account properties changed")
+        for directory in (self.home_base, self.home_base / user):
+            safe_directory(directory)
+        return record, entry, block
+
+    def ensure_token(self, user, permitted):
+        info = safe_file(self.config)
+        original = self.config.read_text()
+        home = self.home_base / user
+        created = False
+        state_path = self.state_path(user)
+        previous_state = None
+        if account(user):
+            record, entry, old_block = self.managed_identity(user)
+            previous_state = state_path.read_text()
+            allowed = re.search(r"^    PermitOpen (.+)$", old_block, re.M)
+            if not allowed:
+                raise SetupError("Managed policy has no forwarding allowlist")
+            permitted = destinations(list(dict.fromkeys([*allowed[1].split(), *permitted])))
+            match = managed_block(original, user)
+        else:
+            if os.path.lexists(home) or os.path.lexists(state_path) or markers(user)[0] in original:
+                raise SetupError("Cannot take over an unmanaged home or policy")
+            record, match = {}, None
+            ensure_state_dir(self.state_dir)
+        block = policy(user, permitted, "token")
+        updated = original[:match.start()] + block + original[match.end():] if match else original.rstrip("\n") + "\n\n" + block
+        changed = updated != original
+        try:
+            self.syntax()
+            if not account(user):
+                run(["useradd", "--no-create-home", "--home-dir", str(home), "--user-group", "--shell", "/usr/sbin/nologin",
+                     "--password", "*", "--comment", "sservcli OpenSSH token account", user])
+                created = True
+                home.mkdir(mode=0o755)
+                os.chown(home, 0, 0)
+                os.chmod(home, 0o755)
+            if changed:
+                atomic_write(self.config, updated, mode=stat.S_IMODE(info.st_mode), owner=(info.st_uid, info.st_gid))
+            self.audit(user, permitted, "token")
+            was_token = record.get("auth_mode") == "token"
+            record.update(user=user, uid=account(user).pw_uid, home=str(home), sshd_config=str(self.config.resolve()),
+                          block_sha256=hashlib.sha256(block.encode()).hexdigest(), auth_mode="token")
+            atomic_write(state_path, json.dumps(record, indent=2) + "\n")
+            if changed:
+                self.reload()
+            if not was_token:
+                self.lock_token(user, record["uid"])
+        except BaseException:
+            if changed:
+                self.restore(original, info)
+            if created:
+                run(["userdel", "--remove", user], check=False)
+                if home.is_dir() and not home.is_symlink() and not account(user):
+                    shutil.rmtree(home)
+                state_path.unlink(missing_ok=True)
+            elif previous_state is not None:
+                atomic_write(state_path, previous_state)
+            raise
+        return {"user": user, "uid": record["uid"], "created": created, "permitted": permitted}
+
+    def set_token(self, user, token):
+        if not re.fullmatch(r"[A-Za-z0-9]{8}", token):
+            raise SetupError("Expected an eight-character base62 token")
+        record, _, _ = self.managed_identity(user)
+        if record.get("auth_mode") != "token":
+            raise SetupError("This managed account is not configured for token passwords")
+        result = subprocess.run(["chpasswd"], input=f"{user}:{token}\n", text=True, capture_output=True)
+        if result.returncode:
+            raise SetupError("Could not set the dedicated SSH password; check the system's password policy")
+
+    def lock_token(self, user, uid):
+        record, entry, _ = self.managed_identity(user)
+        if entry.pw_uid != uid or record.get("auth_mode") != "token":
+            raise SetupError("Refusing to lock an account whose identity or authentication mode changed")
+        run(["usermod", "--lock", user])
+        result = run(["pkill", "-KILL", "-u", str(uid)], check=False)
+        if result.returncode not in (0, 1):
+            raise SetupError("Could not close existing SSH forwarding sessions for the token account")
+
     def bind_key(self, user, permitted, key_path):
         """Reuse a managed identity; never delete it when an update fails."""
         safe_directory(self.state_dir)
@@ -280,6 +397,8 @@ class Provisioner:
         state_info = safe_file(state_path)
         state_original = state_path.read_text()
         record = json.loads(state_original)
+        if record.get("auth_mode") == "token":
+            raise SetupError("This account uses SSH token passwords; use token mode rather than registering a login key")
         info = safe_file(self.config)
         original = self.config.read_text()
         match = managed_block(original, user)
@@ -465,10 +584,91 @@ class Provisioner:
         print(f"Removed managed account and policy: {user}")
 
 
+@contextlib.contextmanager
+def management_lock():
+    with open("/run/lock/sservcli.lock", "a") as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        yield
+
+
+def host_public_key(path, provisioner=None):
+    path = Path(path)
+    if not path.is_file() or path.stat().st_size > 16384:
+        raise SetupError("Expected a small OpenSSH host public key file")
+    text = path.read_text().strip()
+    if len(text) > 16384 or not re.fullmatch(r"(?:ssh-ed25519|ssh-rsa|ecdsa-sha2-nistp(?:256|384|521)) [A-Za-z0-9+/=]+(?: [^\r\n]*)?", text):
+        raise SetupError("Expected a plain OpenSSH server host PUBLIC key")
+    run(["ssh-keygen", "-lf", str(path)])
+    public = " ".join(text.split()[:2])
+    if provisioner:
+        effective = run([provisioner.sshd, "-T", "-f", str(provisioner.config)]).stdout
+        configured = []
+        for line in effective.splitlines():
+            if line.startswith("hostkey "):
+                candidate = Path(line.partition(" ")[2].strip('"') + ".pub")
+                if candidate.is_file() and candidate.stat().st_size <= 16384:
+                    configured.append(" ".join(candidate.read_text().split()[:2]))
+        if public not in configured:
+            raise SetupError("HOST_KEY_FILE does not match a HostKey used by the existing sshd")
+    return public
+
+
+def token_command(args, provisioner, preferred, permitted):
+    account_lock = None
+    ready = None
+    try:
+        with management_lock():
+            if args.ensure_ssh:
+                run(["ssh-keygen", "-A"])
+                run(["systemctl", "enable", "--now", provisioner.service])
+            public = host_public_key(args.host_key, provisioner)
+            user = provisioner.resolve_token_user(preferred)
+            if args.command == "token-serve":
+                account_lock = open(f"/run/lock/sservcli-token-{user}.lock", "a")
+                try:
+                    fcntl.flock(account_lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                except BlockingIOError as error:
+                    raise SetupError("A token controller is already running for this SSH account") from error
+            receipt = provisioner.ensure_token(user, permitted)
+            if account_lock:
+                ready = receipt
+                record = json.loads(provisioner.state_path(user).read_text())
+                alphabet = string.ascii_letters + string.digits
+                while True:
+                    token = "".join(secrets.choice(alphabet) for _ in range(8))
+                    digest = hashlib.sha256(token.encode()).hexdigest()
+                    if digest != record.get("last_token_sha256"):
+                        break
+                provisioner.set_token(user, token)
+                # Password rotation does not terminate authenticated transports.
+                result = run(["pkill", "-KILL", "-u", str(receipt["uid"])], check=False)
+                if result.returncode not in (0, 1):
+                    raise SetupError("Could not close previous token forwarding sessions")
+                record["last_token_sha256"] = digest
+                atomic_write(provisioner.state_path(user), json.dumps(record, indent=2) + "\n")
+                receipt["token"] = token
+            receipt.update(host_public_key=public, requested_user=preferred)
+        print(json.dumps(receipt), flush=True)
+        if account_lock:
+            # Only the unprivileged controller owns this pipe's write end.
+            # EOF revokes the password, including when that controller crashes.
+            for _ in sys.stdin:
+                pass
+        return 0
+    finally:
+        try:
+            if ready:
+                with management_lock():
+                    provisioner.lock_token(ready["user"], ready["uid"])
+        finally:
+            if account_lock:
+                account_lock.close()
+
+
 def parser():
     result = argparse.ArgumentParser(description=__doc__)
     commands = result.add_subparsers(dest="command", required=True)
-    for command in ("render", "install", "ensure", "audit", "remove"):
+    for command in ("render", "install", "ensure", "audit", "remove", "token-prepare", "token-serve"):
         sub = commands.add_parser(command)
         if command != "remove":
             sub.add_argument("--config", help="Client JSON profile; only server authorization fields are read")
@@ -476,7 +676,10 @@ def parser():
         sub.add_argument("--user", help="Dedicated account (default: svc_tunnel)")
         if command in ("install", "ensure"):
             sub.add_argument("--public-key", required=True)
+        if command in ("install", "ensure", "token-prepare", "token-serve"):
             sub.add_argument("--ensure-ssh", action="store_true", help="Generate missing host keys and enable/start the SSH service before installing")
+        if command in ("token-prepare", "token-serve"):
+            sub.add_argument("--host-key", default="/etc/ssh/ssh_host_ed25519_key.pub")
         if command != "render":
             sub.add_argument("--sshd-config", default="/etc/ssh/sshd_config")
             sub.add_argument("--ssh-service", default="ssh")
@@ -492,13 +695,20 @@ def main(argv=None):
         else:
             user, permitted = policy_input(args)
         if args.command == "render":
-            print(policy(user, permitted), end="")
+            mode = "token" if args.config and json.loads(Path(args.config).read_text()).get("version") == 2 else "key"
+            print(policy(user, permitted, mode), end="")
             return 0
         if os.geteuid() != 0:
-            raise SetupError("Run install/ensure/audit/remove as root; render does not need root")
+            raise SetupError("Run account-management commands as root; render does not need root")
         provisioner = Provisioner(args)
-        with open("/run/lock/sservcli.lock", "a") as lock:
-            fcntl.flock(lock, fcntl.LOCK_EX)
+        if args.command in ("token-prepare", "token-serve"):
+            def stop(*_):
+                raise KeyboardInterrupt
+            signal.signal(signal.SIGTERM, stop)
+            signal.signal(signal.SIGINT, stop)
+            signal.signal(signal.SIGHUP, stop)
+            return token_command(args, provisioner, user, permitted)
+        with management_lock():
             if args.command in ("install", "ensure"):
                 if args.ensure_ssh:
                     run(["ssh-keygen", "-A"])
@@ -514,7 +724,13 @@ def main(argv=None):
             elif args.command == "remove":
                 provisioner.remove(user)
             else:
-                print(provisioner.audit(user, provisioner.audit_destinations(user, permitted)), end="")
+                mode = "key"
+                if provisioner.state_path(user).exists():
+                    safe_file(provisioner.state_path(user))
+                    mode = json.loads(provisioner.state_path(user).read_text()).get("auth_mode", "key")
+                print(provisioner.audit(user, provisioner.audit_destinations(user, permitted), mode), end="")
+        return 0
+    except KeyboardInterrupt:
         return 0
     except (SetupError, OSError, ValueError, KeyError, TypeError) as error:
         print(f"sservcli-server: {error}", file=sys.stderr)

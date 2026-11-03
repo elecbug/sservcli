@@ -6,6 +6,8 @@ import tempfile
 import unittest
 from unittest.mock import patch
 
+from profiles import key_profile
+
 ROOT = Path(__file__).resolve().parents[1]
 
 
@@ -17,13 +19,15 @@ class DesktopTests(unittest.TestCase):
         self.temp = tempfile.TemporaryDirectory()
         self.addCleanup(self.temp.cleanup)
         self.directory = Path(self.temp.name)
+        self.key_profile_path = self.directory / "key-profile.json"
+        self.key_profile_path.write_text(json.dumps(key_profile()))
         self.root = tkinter.Tk()
         self.root.withdraw()
         self.app = Desktop(self.root, directory=self.directory, use_tray=False)
         self.addCleanup(self.app.quit)
 
     def test_catalog_json_setup_and_copy_use_the_same_profile(self):
-        profile = json.loads((ROOT / "examples/services.json").read_text())
+        profile = key_profile()
         profile["ssh"]["fallback_hosts"] = ["192.0.2.2", "192.0.2.3"]
         path = self.directory / "services.json"
         path.write_text(json.dumps(profile))
@@ -38,7 +42,7 @@ class DesktopTests(unittest.TestCase):
         self.assertEqual(json.loads((self.directory / "preferences.json").read_text())["config_path"], str(path))
 
     def test_launch_is_disabled_until_connected_and_failure_shows_the_window(self):
-        self.app.load(ROOT / "examples/services.json")
+        self.app.load(self.key_profile_path)
         self.app.services.selection_set("dashboard")
         with patch("sservcli.desktop.launch_service") as launch, patch("sservcli.desktop.messagebox.showerror") as error:
             self.app.open_service()
@@ -56,7 +60,7 @@ class DesktopTests(unittest.TestCase):
         self.assertEqual(self.root.state(), "normal")
 
     def test_quick_edit_preserves_custom_services_and_launch_commands(self):
-        profile = json.loads((ROOT / "examples/services.json").read_text())
+        profile = key_profile()
         custom = {"id": "metrics", "name": "Custom metrics", "kind": "web", "remote_host": "127.0.0.1", "remote_port": 9090, "local_port": 19090}
         profile["services"].append(custom)
         path = self.directory / "services.json"
@@ -78,7 +82,7 @@ class DesktopTests(unittest.TestCase):
     def test_startup_auto_connects_all_enabled_services_and_tray_close_keeps_tunnel(self):
         from sservcli.desktop import Desktop
         from unittest.mock import Mock
-        profile = json.loads((ROOT / "examples/services.json").read_text())
+        profile = key_profile()
         profile["ssh"]["identity_file"] = None
         path = self.directory / "startup.json"
         path.write_text(json.dumps(profile))
@@ -103,9 +107,12 @@ class DesktopTests(unittest.TestCase):
             self.assertEqual(self.root.state(), "normal")
 
     def test_token_connection_keeps_case_and_stores_credentials_outside_profile(self):
-        from sservcli.token_auth import host_identity, remembered_token
+        from sservcli.token_auth import remembered_token
+        import subprocess
         profile = json.loads((ROOT / "examples/services.token.json").read_text())
-        _, profile["ssh"]["host_public_key"] = host_identity(self.directory / "server-state")
+        key = self.directory / "host"
+        subprocess.run(["ssh-keygen", "-q", "-t", "ed25519", "-N", "", "-f", str(key)], check=True)
+        profile["ssh"]["host_public_key"] = key.with_suffix(".pub").read_text().strip()
         path = self.directory / "token-profile.json"
         path.write_text(json.dumps(profile))
         self.app.load(path)

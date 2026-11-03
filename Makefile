@@ -14,25 +14,23 @@ VENV_DIR ?= .venv
 VENV_PYTHON = $(VENV_DIR)/bin/python
 RUN_PYTHON = $(if $(wildcard $(VENV_PYTHON)),$(VENV_PYTHON),$(PYTHON))
 SERVER_STATE ?= var/server
-LISTEN ?= 0.0.0.0
 
 export TUNNEL_USER PUBKEY_FILE PERMIT_OPEN SSHD_CONFIG SSH_SERVICE CONFIG
 export HOST_KEY_FILE BUNDLE_OUTPUT DRY_RUN
 export SERVER_STATE TOKEN_PORT LEGACY_SSH
-export LISTEN
 
 .PHONY: help setup server create delete audit render build check test integration desktop bundle bundle-windows client-zip
 
 help:
 	@printf '%s\n' \
-	  'make setup                           Install Python SSH dependencies in .venv' \
-	  'make server CONFIG=services.json     Run token SSH server; print a new 8-character token' \
+	  'make setup                           Check Python and native OpenSSH (no pip dependencies)' \
+	  'make server CONFIG=services.json     Issue an SSH password token using the existing sshd (sudo)' \
 	  'make check                           Validate Python sources and example profiles' \
 	  'make test                            Run Python unit tests (no account changes)' \
 	  'make integration                     Run temporary local sshd integration tests' \
 	  'make desktop [CONFIG=services.json]   Run the Tkinter client' \
 	  'make build                           Check sources; no compilation is needed' \
-	  'make bundle CONFIG=services.json     Package Windows client with pinned server key; no token in ZIP' \
+	  'make bundle CONFIG=services.json     Prepare/reuse restricted SSH account; create Windows ZIP' \
 	  'make bundle LEGACY_SSH=1 PUBKEY_FILE=<client.pub> CONFIG=<services.json>  Old account/key workflow' \
 	  'make client-zip CONFIG=<services.json> Package client only; preserve existing server accounts' \
 	  'make render CONFIG=services.json      Preview server SSH policy' \
@@ -40,15 +38,11 @@ help:
 	  'sudo make audit [TUNNEL_USER=svc_tunnel]' \
 	  'sudo make delete [TUNNEL_USER=svc_tunnel]'
 
-$(VENV_DIR)/.sservcli-ready: requirements.txt
-	$(PYTHON) -m venv "$(VENV_DIR)"
-	"$(VENV_PYTHON)" -m pip --disable-pip-version-check install --only-binary=:all: -r requirements.txt
-	@touch "$@"
-
-setup: $(VENV_DIR)/.sservcli-ready
+setup:
+	"$(RUN_PYTHON)" -c 'import sys; assert sys.version_info >= (3, 11), "Python 3.11+ required"; from sservcli.tunnel import openssh_program; print("Python and native OpenSSH ready:", openssh_program())'
 
 server: setup
-	"$(RUN_PYTHON)" -m sservcli serve --config "$$CONFIG" --state-dir "$$SERVER_STATE" --listen "$$LISTEN"
+	"$(RUN_PYTHON)" -m sservcli serve --config "$$CONFIG" --state-dir "$$SERVER_STATE"
 
 create:
 	@test -n "$$PUBKEY_FILE" || { echo 'Set PUBKEY_FILE to a public key file' >&2; exit 1; }
@@ -69,14 +63,14 @@ check: setup
 	"$(RUN_PYTHON)" -m compileall -q sservcli server tools tests
 	"$(RUN_PYTHON)" -m sservcli check --config examples/services.token.json
 	"$(RUN_PYTHON)" -m sservcli check --config examples/services.token.windows.json
-	"$(RUN_PYTHON)" -m sservcli check --config examples/services.json
-	"$(RUN_PYTHON)" server/sservcli_server.py render --config examples/services.json >/dev/null
+	"$(RUN_PYTHON)" server/sservcli_server.py render --config examples/services.token.json >/dev/null
 
 test: setup
 	"$(RUN_PYTHON)" -m unittest discover -s tests -v
 
 integration: setup
 	SSERVCLI_SSH_TESTS=1 "$(RUN_PYTHON)" -m unittest discover -s tests -p test_ssh_integration.py -v
+	SSERVCLI_SSH_TESTS=1 "$(RUN_PYTHON)" -m unittest discover -s tests -p test_token_ssh.py -v
 
 desktop: setup
 	"$(RUN_PYTHON)" -m sservcli desktop --config "$$CONFIG"
