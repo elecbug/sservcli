@@ -5,6 +5,52 @@ const invoke = window.__TAURI__?.core?.invoke;
 let current = null;
 let rendered = "";
 let busy = false;
+let lastError = "";
+
+function addServiceRow(service = {}) {
+  const rows = [...$("quick-services").children];
+  const used = new Set(rows.map((row) => row.service.id));
+  let index = 1;
+  while (used.has(`service-${index}`)) index++;
+  const row = document.createElement("div");
+  row.className = "quick-row";
+  row.service = { id: `service-${index}`, name: "Web service", kind: "web", remote_host: "127.0.0.1", remote_port: 8080 + rows.length, local_port: 18080 + rows.length, enabled: true, path: "/", scheme: "http", launch: null, ...service };
+  for (const [name, label] of [["name", "Service name"], ["kind", "Service type"], ["remote_port", "Server port"], ["local_port", "Local port"], ["enabled", "Enable service"]]) {
+    const input = document.createElement(name === "kind" ? "select" : "input");
+    input.dataset.field = name;
+    input.setAttribute("aria-label", label);
+    if (name === "kind") {
+      for (const kind of ["web", "api", "database", "tcp"]) input.add(new Option(kind, kind));
+      input.value = row.service.kind;
+    } else if (name === "enabled") {
+      input.type = "checkbox";
+      input.checked = row.service.enabled;
+    } else {
+      input.required = true;
+      input.value = row.service[name];
+      if (name.endsWith("port")) { input.type = "number"; input.min = name === "local_port" ? "1024" : "1"; input.max = "65535"; }
+    }
+    row.append(input);
+  }
+  const remove = document.createElement("button");
+  remove.type = "button";
+  remove.textContent = "×";
+  remove.setAttribute("aria-label", "Remove service");
+  remove.addEventListener("click", () => row.remove());
+  row.append(remove);
+  $("quick-services").append(row);
+}
+
+function fillQuickForm(config) {
+  $("quick-host").value = config.ssh.host;
+  $("quick-port").value = config.ssh.port;
+  $("quick-fallbacks").value = (config.ssh.fallback_hosts ?? []).join(", ");
+  $("quick-user").value = config.ssh.user;
+  $("quick-identity").value = config.ssh.identity_file ?? "";
+  $("quick-host-key").value = config.ssh.host_public_key ?? "";
+  $("quick-services").replaceChildren();
+  for (const service of config.services) addServiceRow(service);
+}
 
 function tab(name) {
   for (const section of document.querySelectorAll(".tab")) section.hidden = section.id !== name;
@@ -38,13 +84,20 @@ function paint(view, populateEditor = false) {
   $("connection").textContent = active ? "Disconnect" : "Connect server";
   $("connection").disabled = !config;
   $("connection-message").textContent = connection.message;
-  if (config) $("server-address").textContent = `${config.ssh.user}@${config.ssh.host}:${config.ssh.port}`;
+  if (config) $("server-address").textContent = `${config.ssh.user}@${connection.active_host ?? config.ssh.host}:${config.ssh.port}`;
+  $("server-fingerprint").hidden = !active || !connection.host_key_fingerprint;
+  $("server-fingerprint").textContent = connection.host_key_fingerprint ? `Pinned host key: ${connection.host_key_fingerprint}` : "";
+  if (view.error && view.error !== lastError) { notify(view.error); lastError = view.error; }
+  if (!view.error) lastError = "";
   $("service-count").textContent = config?.services.length ?? 0;
   $("logs").textContent = connection.logs.join("\n") || "No connection activity yet.";
   for (const id of ["save", "load", "example", "profile-path", "profile-editor"]) $(id).disabled = active;
+  for (const field of $("quick-form").querySelectorAll("input,textarea,select,button")) field.disabled = active;
   if (populateEditor && config) {
     $("profile-path").value = view.path;
     $("profile-editor").value = JSON.stringify(config, null, 2);
+    fillQuickForm(config);
+    for (const field of $("quick-form").querySelectorAll("input,textarea,select,button")) field.disabled = active;
   }
   const key = JSON.stringify([config, ready]);
   if (key === rendered || !config) return;
@@ -96,6 +149,27 @@ $("example").addEventListener("click", () => action(async () => {
   $("profile-editor").value = await invoke("example_profile");
 }));
 
+$("add-service").addEventListener("click", () => addServiceRow());
+$("quick-form").addEventListener("submit", (event) => {
+  event.preventDefault();
+  action(async () => {
+    const services = [...$("quick-services").children].map((row) => {
+      const service = { ...row.service };
+      for (const field of row.querySelectorAll("[data-field]")) {
+        const name = field.dataset.field;
+        service[name] = name === "enabled" ? field.checked : name.endsWith("port") ? Number(field.value) : field.value;
+      }
+      return service;
+    });
+    if (!services.length) throw new Error("Add at least one service.");
+    const setup = { host: $("quick-host").value.trim(), port: Number($("quick-port").value),
+      fallback_hosts: $("quick-fallbacks").value.split(/[\s,]+/).filter(Boolean), user: $("quick-user").value.trim(),
+      identity_file: $("quick-identity").value.trim() || null, host_public_key: $("quick-host-key").value, services };
+    paint(await invoke("quick_connect", { setup }), true);
+    tab("services");
+  });
+});
+
 async function poll() {
   try { if (!busy) paint(await invoke("get_state")); }
   catch (error) { notify(String(error)); }
@@ -103,8 +177,9 @@ async function poll() {
 }
 
 if (invoke) {
-  action(async () => { $("profile-editor").value = await invoke("example_profile"); paint(await invoke("get_state")); });
+  action(async () => { $("profile-editor").value = await invoke("example_profile"); const view = await invoke("get_state"); paint(view, true); if (!view.config) tab("settings"); });
   setTimeout(poll, 750);
 } else {
   notify("Open this interface with the Tauri desktop app to manage SSH connections.");
 }
+addServiceRow({ id: "dashboard", name: "Web dashboard" });

@@ -12,6 +12,87 @@ grant a remote shell.
 
 ## Architecture
 
+The recommended setup uses an existing SSH account and its already-authorized
+private key or Agent. The server provisioning tool is optional. The desktop app
+forwards every enabled service automatically at launch and stays in the tray.
+
+### Quick connection with an existing account
+
+In **Connection settings**, enter your server address, SSH username, optional
+fallback addresses, and the trusted server host public key. Enter an existing
+private-key path, or leave it empty to use SSH Agent/default identities. Add your
+service ports and click **Save & connect all**. There is no need to create another
+server account or manually edit `known_hosts` when the existing account already
+allows TCP forwarding.
+
+The host public key identifies the server; your private key or Agent authenticates
+the account. Obtain the host `.pub` line and verify its fingerprint through a
+trusted administrator channel:
+
+```sh
+cat /etc/ssh/ssh_host_ed25519_key.pub
+ssh-keygen -lf /etc/ssh/ssh_host_ed25519_key.pub
+```
+
+Alternatively, create the profile from a trusted host-public-key file:
+
+```sh
+sservcli init --host 192.0.2.10 --fallback-hosts 192.0.2.11,192.0.2.12 \
+  --user ubuntu --host-key server-host-key.pub --identity "~/.ssh/id_ed25519"
+sservcli connect --config services.json
+```
+
+Omit `--identity` to use Agent/default identities. `init` refuses to overwrite
+an existing profile and does not modify the server. The initial service forwards
+local port `18080` to server port `8080`; override these with `--local-port` and
+`--remote-port`. `--port` selects the SSH port, and `--config` selects the output
+file. The desktop form can add multiple services without editing JSON.
+
+The saved profile is restored on the next desktop launch and all enabled services
+connect automatically in the background. **Local services…** in the tray opens
+the endpoint list. Closing the window keeps forwarding active; **Disconnect**
+stops the tunnel and **Quit** exits. Launching the desktop app a second time opens
+the existing instance. A terminal connection failure shows the window for diagnosis.
+The CLI's `connect` command remains attached to its terminal until Ctrl+C; the
+desktop executable provides the background/tray lifecycle.
+
+### Fallback IP array and inline host key
+
+Simple connections store this SSH section in the profile:
+
+```json
+"ssh": {
+  "host": "192.0.2.10",
+  "fallback_hosts": ["192.0.2.11", "192.0.2.12"],
+  "port": 22,
+  "user": "ubuntu",
+  "identity_file": null,
+  "host_public_key": "ssh-ed25519 REPLACE_WITH_THE_REAL_SERVER_PUBLIC_KEY"
+}
+```
+
+Use the actual complete host `.pub` line. The primary address is tried first,
+followed by the array in order. All addresses share one SSH port, username,
+identity, and pinned host key; use alternative routes to the same trusted server.
+Different host keys are rejected on every address. There may be at most 16 unique
+addresses including the primary. On startup the list is tried once; after an
+interrupted established connection, bounded recovery cycles start with the next
+address in the list. All services move together to the selected address.
+
+Choose exactly one verification source: `host_public_key` or `known_hosts_file`.
+The inline key is validated with `ssh-keygen`; a private temporary host-key file
+covers all candidate addresses and is removed on normal disconnect. Your personal
+SSH files are not modified. Advanced `known_hosts_file` profiles must contain
+trusted entries for each fallback address. `command` is available for those
+advanced profiles; use `connect` to manage the temporary file for inline-key profiles.
+
+The service list shows local addresses and forwarding state. **Forwarding** means
+SSH authenticated and its local listeners are ready, rather than an application
+health check. Database/TCP clients can connect to those local ports. An optional
+`launch` array enables the corresponding external-client launch button.
+
+### Transport
+
 ```mermaid
 flowchart LR
     UI[Desktop UI or CLI] --> Manager[Rust connection manager]
@@ -39,19 +120,19 @@ control socket confirms successful authentication and listener setup. On Windows
 the native TCP table must show that this SSH process owns every enabled loopback
 listener; an unrelated process listening on the same port cannot satisfy this
 check. Keepalives detect broken transports. Interrupted connections use bounded exponential backoff;
-initial authentication, host-key, or listener failures stop immediately.
+initial failures try the ordered address list once and then stop.
 
 ## Requirements
 
 - **CLI:** Windows 10/11, Linux, or macOS, an OpenSSH client, Rust 1.75+
   and Cargo to build. The core has no GTK, Node.js, or Tauri dependency.
-- **Desktop:** Windows 10/11, Linux, or macOS, current stable Rust, Node.js 20.19+ or 22.12+,
+- **Desktop:** Windows 10/11, Linux, or macOS, current stable Rust (at least 1.90 for the current single-instance plugin), Node.js 20.19+ or 22.12+,
   and the [Tauri 2 platform prerequisites](https://v2.tauri.app/start/prerequisites/).
   Linux requires the GTK/WebKit development libraries listed there. Current
   Tauri dependencies may need a newer compiler than Tauri's original minimum.
   Windows development requires Microsoft C++ Build Tools, an MSVC Rust toolchain,
   and the WebView2 runtime described in those prerequisites.
-- **Server provisioning:** Ubuntu with Python 3.10+, OpenSSH server, systemd,
+- **Optional server provisioning:** Ubuntu with Python 3.10+, OpenSSH server, systemd,
   `useradd`, `userdel`, `pkill`, and root access. The default systemd unit is `ssh`.
 - **Service clients:** Your browser, `psql`, or any other configured executable.
 
@@ -61,7 +142,83 @@ OpenSSH Client feature is preferred over Git/WSL SSH wrappers; portable native
 provisioning remains an Ubuntu administrator task; Windows clients connect to
 the same server and use the same destination restrictions.
 
-## Quick start
+## Optional setup with a restricted server account
+
+### One command: server setup and a ready Windows ZIP
+
+On the Ubuntu server, supply the existing Windows client's **Ed25519 public key**
+and a reachable server address:
+
+```sh
+make bundle SERVER_HOST=203.0.113.10 PUBKEY_FILE=/path/to/client-id_ed25519.pub \
+  FALLBACK_HOSTS='["203.0.113.11", "192.0.2.10"]'
+```
+
+This builds the local profile validator, requests a native Windows build on
+GitHub Actions, enables/starts OpenSSH and creates missing host keys, installs
+the new forwarding-only account, registers the supplied client public key, and
+publishes `dist/sservcli-windows-svc_tunnel.zip`. Privileged setup uses `sudo`
+after native binaries and profile validation succeed. Your client private key
+stays on Windows and is never uploaded to CI or included in the ZIP.
+
+The native build requires a committed, pushed source revision containing
+`.github/workflows/windows-binaries.yml` and `gh auth login` on the server.
+The workflow must first be available on the repository's default branch for
+[manual dispatch](https://docs.github.com/en/actions/reference/workflows-and-actions/events-that-trigger-workflows#workflow_dispatch).
+Run `make bundle` as your normal user so GitHub CLI can use that login. The
+command also requires Rust/Cargo, Python 3.10+, OpenSSH server/client, and sudo.
+The remote revision must match local HEAD; uncommitted source is refused.
+For an existing native build, skip GitHub entirely:
+
+```sh
+make bundle SERVER_HOST=203.0.113.10 PUBKEY_FILE=/path/to/client.pub \
+  WINDOWS_ARTIFACT=/path/to/sservcli-windows-binaries.zip
+```
+
+`WINDOWS_ARTIFACT` can also be a directory containing native Windows x64
+`sservcli.exe` and `sservcli-desktop.exe` built from the current source. The
+workflow's `sservcli-windows-binaries` artifact provides these files. Linux
+executables renamed to `.exe` are rejected. Native builds occur before account
+creation; a late packaging failure attempts to remove the newly created account.
+
+Preview without changing accounts, SSH services, or dispatching a remote build:
+
+```sh
+make bundle DRY_RUN=1 SERVER_HOST=203.0.113.10 PUBKEY_FILE=/path/to/client.pub
+```
+
+Other options are `TUNNEL_USER`, `CONFIG`, `SERVER_PORT`, `CLIENT_IDENTITY`,
+`HOST_KEY_FILE`, `WINDOWS_REPO`, `WINDOWS_REF`, and `BUNDLE_OUTPUT`. The default
+services come from `services.json` when present, otherwise the example profile.
+`CLIENT_IDENTITY="~/.ssh/id_ed25519"` selects an existing Windows-side key path;
+by default Agent/default identities are used. `SERVER_PORT` must match an SSH
+port already configured on the server. Existing users, managed accounts, and
+existing output ZIPs are refused; choose a new account/output or administer the
+existing account explicitly.
+
+The ZIP contains both executables, `services.json` with the server host public
+key and fallback array, `server-host-key.pub`, `Start.cmd`, a short README, and
+SHA-256 checksums. Download and extract the whole ZIP on Windows, then run
+**Start.cmd**. It loads the adjacent profile and starts all enabled forwards in
+the background. Native OpenSSH Client and WebView2 must be available on Windows,
+and the existing identity must be usable there. No client password or private
+key is distributed.
+
+Download using your existing administrator SSH account, because the new
+forwarding-only account intentionally has no SFTP/SCP sessions. For example,
+from Windows PowerShell (replace the server path and administrator username):
+
+```powershell
+scp.exe admin@203.0.113.10:/path/to/sservcli/dist/sservcli-windows-svc_tunnel.zip .
+Expand-Archive .\sservcli-windows-svc_tunnel.zip -DestinationPath .\sservcli-client
+.\sservcli-client\Start.cmd
+```
+
+### Individual administration commands
+
+Use this administrator workflow when you want a new forwarding-only account.
+Existing SSH accounts that already permit the required forwarding can use the
+quick connection above instead.
 
 ### 1. Create a client profile and SSH identity
 
@@ -172,11 +329,13 @@ npm ci
 npm run dev
 ```
 
-Open **Connection settings**, enter the profile's filesystem path, and click
+Open **Connection settings > Advanced**, enter the profile's filesystem path, and click
 **Load profile**. The built-in editor can validate and save a profile, including
 its per-service `enabled` settings. Disconnect before editing. In **Services**,
 click **Connect server**, then **Open service** or **Launch client**. The
-**Connection log** shows the last 200 SSH messages in memory.
+**Connection log** shows the last 200 SSH messages in memory. The profile is
+remembered and reconnects at the next launch; close the window to keep it in the
+tray, or use **Quit** in the tray menu to stop all forwarding.
 
 `npm run build` produces the native executable in
 `client/desktop/src-tauri/target/release/`. Installer bundling is disabled; code
@@ -272,9 +431,11 @@ the client to catch misspelled settings.
 | --- | --- |
 | `version` | Schema version; currently `1` |
 | `name` | Display name for this server |
-| `ssh.host`, `ssh.port`, `ssh.user` | Actual hostname/IP, port (default `22`), dedicated account |
+| `ssh.host`, `ssh.port`, `ssh.user` | Primary hostname/IP, port (default `22`), existing or dedicated account |
+| `ssh.fallback_hosts` | Ordered array of alternative addresses; default empty |
 | `ssh.identity_file` | Private key or public identity file; `null` for agent selection |
-| `ssh.known_hosts_file` | Required verified host-key database |
+| `ssh.host_public_key` | Trusted inline server host public key; manages verification automatically |
+| `ssh.known_hosts_file` | Advanced verified host-key database, as an alternative to `host_public_key` |
 | `reconnect.enabled` | Retry interrupted established connections; default `true` |
 | `reconnect.max_attempts` | Total retries per Connect action; default `5`, maximum `100` |
 | `reconnect.initial_delay_secs` | First retry delay; default `2` |
@@ -305,7 +466,8 @@ Web/API services without a launch array use the native default browser on
 Windows, `xdg-open` on Linux, or `open` on macOS; database/TCP services require a
 launch array to use the launch button.
 
-Changing a client's destination does not authorize it on the server. The server
+When using a restricted server account, changing a client's destination does not
+authorize it on the server. The server
 renderer includes **all** listed services, even those disabled in the UI; the
 `enabled` flag is a client preference. To change authorization in this version,
 remove and reinstall the managed account with the revised profile. This
@@ -365,6 +527,11 @@ make check        # Example validation, policy rendering, JavaScript syntax
 make test         # Rust unit tests + Python server transaction tests
 make integration  # Real temporary OpenSSH daemon and loopback services
 ```
+
+Integration tests also cover supplied host keys, existing Agent authentication,
+ordered fallback addresses, and first-time profile creation. Packaging tests use
+real key/profile validation and ZIP contents while mocking privileged account
+changes and GitHub dispatch; they do not create real users or run remote builds.
 
 Integration tests require an installed OpenSSH server, a usable local user, and
 the platform's SSH privilege-separation runtime directory (on Ubuntu,

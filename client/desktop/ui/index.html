@@ -21,19 +21,37 @@
     <div id="notification" role="alert" hidden></div>
     <section id="services" class="tab">
       <div class="title-row"><div><p class="eyebrow">CONNECTED TO YOUR SERVER</p><h1>Your services, together.</h1><p class="subtitle">A single secure connection to the tools you work with.</p></div><button id="connection" class="primary" disabled>Connect server</button></div>
-      <div class="connection-summary"><span class="connection-icon">⇄</span><div><strong id="server-address">Load a connection profile to get started</strong><p id="connection-message">Configure your SSH server and the services you want to access.</p></div></div>
+      <div class="connection-summary"><span class="connection-icon">⇄</span><div><strong id="server-address">Set up your existing SSH connection</strong><p id="connection-message">Configure your SSH server and the services you want to access.</p><p id="server-fingerprint" hidden></p></div></div>
       <div class="section-heading"><h2>Services <span id="service-count">0</span></h2><span>Local access through SSH</span></div>
       <div id="service-grid" class="grid"><div class="empty">Your services will appear here.<br><button id="get-started">Set up a connection →</button></div></div>
       <p class="note">◇ Local listeners are available only on 127.0.0.1. Each service keeps its own sign-in and access controls.</p>
+      <p class="note">Closing this window keeps forwarding active in the background. Use the tray menu to show services, disconnect, or quit.</p>
     </section>
     <section id="settings" class="tab" hidden>
-      <p class="eyebrow">MAKE IT YOURS</p><h1>Connection settings</h1><p class="subtitle">Load or edit a trusted local JSON profile. Disconnect before making changes.</p>
+      <p class="eyebrow">CONNECT ONCE. KEEP WORKING.</p><h1>Connection settings</h1><p class="subtitle">Use the SSH account and private key or Agent you already have. Saved services connect automatically when the app starts.</p>
+      <form id="quick-form">
+        <div class="quick-fields">
+          <label>Server IP or hostname<input id="quick-host" required placeholder="server.example.com" spellcheck="false"></label>
+          <label>SSH port<input id="quick-port" required type="number" min="1" max="65535" value="22"></label>
+          <label class="wide">Fallback IPs or hostnames<input id="quick-fallbacks" placeholder="192.0.2.10, 192.0.2.11" spellcheck="false"><span class="help">Tried in order if a connection fails. Every address must present the supplied server host key.</span></label>
+          <label class="wide">Existing SSH username<input id="quick-user" required placeholder="ubuntu" autocomplete="username" spellcheck="false"></label>
+          <label class="wide">Existing private key path (optional)<input id="quick-identity" placeholder="Leave empty to use SSH Agent or default identities" spellcheck="false"></label>
+          <label class="wide">Server host public key<textarea id="quick-host-key" class="quick-key" required placeholder="ssh-ed25519 AAAA… server" spellcheck="false"></textarea><span class="help">Paste the trusted server host .pub line. Your private key or SSH Agent authenticates your existing account; the host key verifies the server.</span></label>
+        </div>
+        <div class="section-heading"><h2>Local services</h2><button id="add-service" type="button">+ Add service</button></div>
+        <div class="quick-row quick-head"><span>Name</span><span>Type</span><span>Server port</span><span>Local port</span><span>On</span><span></span></div>
+        <div id="quick-services"></div>
+        <p class="help">All enabled services are forwarded together. Database and TCP clients can use the local addresses shown in Services.</p>
+        <div class="editor-actions"><span class="help">Your connection is saved for the next launch.</span><button type="submit" class="primary">Save &amp; connect all</button></div>
+      </form>
+      <details class="advanced"><summary>Advanced: import or edit a JSON profile</summary>
       <label for="profile-path">Profile file path</label>
       <div class="path-row"><input id="profile-path" placeholder="Path to services.json" spellcheck="false"><button id="load">Load profile</button></div>
       <label for="profile-editor">Profile configuration</label>
       <p class="help">SSH paths resolve relative to this file; ~/ is supported. Set identity_file to null to use SSH Agent. Launch arrays execute local programs, so use profiles from trusted sources.</p>
       <textarea id="profile-editor" spellcheck="false" aria-label="JSON profile configuration"></textarea>
       <div class="editor-actions"><button id="example">Use example</button><button id="save" class="primary">Validate &amp; save profile</button></div>
+      </details>
     </section>
     <section id="activity" class="tab" hidden>
       <p class="eyebrow">UNDER THE HOOD</p><h1>Connection log</h1><p class="subtitle">Recent SSH diagnostics and connection changes. The last 200 messages are kept in memory.</p>

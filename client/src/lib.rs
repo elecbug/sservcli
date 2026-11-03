@@ -1,5 +1,7 @@
 pub mod config;
+pub mod host_key;
 pub mod platform;
+pub mod setup;
 pub mod tunnel;
 
 #[cfg(windows)]

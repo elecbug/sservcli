@@ -20,11 +20,24 @@ pub struct Config {
 #[serde(deny_unknown_fields)]
 pub struct Ssh {
     pub host: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub fallback_hosts: Vec<String>,
     #[serde(default = "ssh_port")]
     pub port: u16,
     pub user: String,
     pub identity_file: Option<String>,
-    pub known_hosts_file: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub known_hosts_file: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub host_public_key: Option<String>,
+}
+
+impl Ssh {
+    pub fn hosts(&self) -> Vec<&str> {
+        std::iter::once(self.host.as_str())
+            .chain(self.fallback_hosts.iter().map(String::as_str))
+            .collect()
+    }
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -100,6 +113,15 @@ fn identifier(value: &str) -> bool {
             .all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-')
 }
 
+pub(crate) fn valid_host(host: &str) -> bool {
+    !host.is_empty()
+        && host.len() <= 253
+        && !host.starts_with('-')
+        && host
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b".-:".contains(&b))
+}
+
 impl Config {
     pub fn parse(text: &str) -> Result<Self, String> {
         let config: Self =
@@ -120,20 +142,36 @@ impl Config {
             return Err("name must contain 1–128 characters".into());
         }
         let host = &self.ssh.host;
-        if host.is_empty()
-            || host.len() > 253
-            || host.starts_with('-')
-            || !host
-                .bytes()
-                .all(|b| b.is_ascii_alphanumeric() || b".-:".contains(&b))
-        {
+        if !valid_host(host) {
             return Err("ssh.host must be a hostname or an unbracketed IP address".into());
+        }
+        let hosts = self.ssh.hosts();
+        let mut unique = HashSet::new();
+        if hosts.len() > 16
+            || hosts
+                .iter()
+                .any(|host| !valid_host(host) || !unique.insert(host.to_ascii_lowercase()))
+        {
+            return Err("SSH addresses must be valid, unique hostnames/IPs; configure at most 16 including the primary host".into());
         }
         let user = &self.ssh.user;
         if !identifier(user) || user.starts_with('-') || self.ssh.port == 0 {
             return Err("Invalid SSH user or port".into());
         }
-        for path in std::iter::once(&self.ssh.known_hosts_file).chain(self.ssh.identity_file.iter())
+        match (&self.ssh.host_public_key, &self.ssh.known_hosts_file) {
+            (Some(key), None) => {
+                crate::host_key::normalize(key)?;
+            }
+            (None, Some(_)) => {}
+            _ => {
+                return Err("Set exactly one of ssh.host_public_key or ssh.known_hosts_file".into())
+            }
+        }
+        for path in self
+            .ssh
+            .known_hosts_file
+            .iter()
+            .chain(self.ssh.identity_file.iter())
         {
             if path.is_empty() || path.chars().any(|c| c.is_control() || c == '"' || c == '%') {
                 return Err(
@@ -210,8 +248,12 @@ impl Config {
         let base = fs::canonicalize(profile).map_err(|e| format!("{}: {e}", profile.display()))?;
         let base = base.parent().ok_or("Profile has no parent directory")?;
         let mut result = self.clone();
-        result.ssh.known_hosts_file =
-            crate::platform::ssh_path(&resolve_path(&self.ssh.known_hosts_file, base)?)?;
+        result.ssh.known_hosts_file = self
+            .ssh
+            .known_hosts_file
+            .as_ref()
+            .map(|p| resolve_path(p, base).and_then(|p| crate::platform::ssh_path(&p)))
+            .transpose()?;
         result.ssh.identity_file = self
             .ssh
             .identity_file
@@ -306,6 +348,25 @@ mod tests {
         assert!(c.services[2].launch_argv().unwrap().is_none());
     }
 
+    #[test]
+    fn host_key_sources_and_fallback_addresses_are_unambiguous() {
+        let mut c = example();
+        c.ssh.host_public_key = Some("ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIexample".into());
+        assert!(c.validate().is_err());
+        c.ssh.known_hosts_file = None;
+        assert!(c.validate().is_ok());
+        c.ssh.fallback_hosts = vec![c.ssh.host.clone()];
+        assert!(c.validate().is_err());
+        c.ssh.fallback_hosts = vec!["192.0.2.10".into(), "192.0.2.11".into()];
+        assert!(c.validate().is_ok());
+        assert_eq!(
+            c.ssh.hosts(),
+            ["server.example.com", "192.0.2.10", "192.0.2.11"]
+        );
+        c.ssh.host_public_key = None;
+        assert!(c.validate().is_err());
+    }
+
     #[cfg(windows)]
     #[test]
     fn windows_home_and_profile_relative_paths() {
@@ -328,7 +389,7 @@ mod tests {
                 2 => c.services[0].remote_host = "0.0.0.0".into(),
                 3 => c.services[0].path = "//attacker.example".into(),
                 4 => c.services[0].launch = Some(vec!["tool".into(), "{password}".into()]),
-                5 => c.ssh.known_hosts_file = "x\nProxyCommand evil".into(),
+                5 => c.ssh.known_hosts_file = Some("x\nProxyCommand evil".into()),
                 _ => c.reconnect.max_delay_secs = 0,
             }
             assert!(c.validate().is_err(), "mutation {mutation}");

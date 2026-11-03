@@ -18,6 +18,8 @@ pub struct Snapshot {
     pub attempt: u32,
     pub message: String,
     pub logs: VecDeque<String>,
+    pub host_key_fingerprint: Option<String>,
+    pub active_host: Option<String>,
 }
 
 impl Default for Snapshot {
@@ -27,6 +29,8 @@ impl Default for Snapshot {
             attempt: 0,
             message: "No SSH connection".into(),
             logs: VecDeque::new(),
+            host_key_fingerprint: None,
+            active_host: None,
         }
     }
 }
@@ -43,6 +47,9 @@ fn update(state: &Mutex<Snapshot>, status: &str, message: impl Into<String>, att
     s.status = status.into();
     s.message = message.into();
     s.attempt = attempt;
+    if status != "connected" {
+        s.active_host = None;
+    }
     let message = s.message.clone();
     s.logs.push_back(message);
     while s.logs.len() > 200 {
@@ -55,13 +62,34 @@ impl Tunnel {
         self.state.lock().unwrap_or_else(|e| e.into_inner()).clone()
     }
 
-    pub fn connect(&mut self, config: Config) -> Result<(), String> {
+    pub fn connect(&mut self, mut config: Config) -> Result<(), String> {
         config.validate()?;
         if self.worker.as_ref().is_some_and(|w| !w.is_finished()) {
             return Err("Disconnect the current connection first".into());
         }
         self.disconnect();
-        if !Path::new(&config.ssh.known_hosts_file).is_file() {
+        let pinned = config
+            .ssh
+            .host_public_key
+            .as_deref()
+            .map(|key| {
+                crate::host_key::PinnedHostKey::prepare_hosts(
+                    &config.ssh.hosts(),
+                    config.ssh.port,
+                    key,
+                )
+            })
+            .transpose()?;
+        if let Some(key) = &pinned {
+            config.ssh.known_hosts_file = Some(crate::platform::ssh_path(key.path())?);
+            config.ssh.host_public_key = None;
+        }
+        if !config
+            .ssh
+            .known_hosts_file
+            .as_deref()
+            .is_some_and(|path| Path::new(path).is_file())
+        {
             return Err(
                 "known_hosts_file is missing; install a verified server host key first".into(),
             );
@@ -85,6 +113,10 @@ impl Tunnel {
         let directory = ConnectionControl::new()?;
         let (tx, rx) = mpsc::channel();
         let state = self.state.clone();
+        state
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .host_key_fingerprint = pinned.as_ref().map(|key| key.fingerprint.clone());
         update(
             &state,
             "connecting",
@@ -92,6 +124,8 @@ impl Tunnel {
             0,
         );
         self.worker = Some(thread::spawn(move || {
+            // Keep the supplied host key pinned throughout reconnect attempts.
+            let _pinned = pinned;
             supervise(config, directory, state, rx)
         }));
         self.stop = Some(tx);
@@ -170,7 +204,10 @@ pub fn ssh_args(config: &Config, control: Option<&Path>) -> Vec<String> {
     }
     args.extend([
         "-o".into(),
-        format!("UserKnownHostsFile=\"{}\"", config.ssh.known_hosts_file),
+        format!(
+            "UserKnownHostsFile=\"{}\"",
+            config.ssh.known_hosts_file.as_deref().unwrap_or("none")
+        ),
     ]);
     #[cfg(unix)]
     {
@@ -256,7 +293,11 @@ impl Drop for ConnectionControl {
     }
 }
 
-struct SshChild(Child, #[cfg(windows)] crate::windows::ChildJob);
+struct SshChild {
+    child: Child,
+    #[cfg(windows)]
+    _job: crate::windows::ChildJob,
+}
 impl SshChild {
     fn new(child: Child) -> Result<Self, String> {
         #[cfg(windows)]
@@ -270,18 +311,18 @@ impl SshChild {
                     return Err(error);
                 }
             };
-            Ok(Self(child, job))
+            Ok(Self { child, _job: job })
         }
         #[cfg(not(windows))]
         {
-            Ok(Self(child))
+            Ok(Self { child })
         }
     }
 }
 impl Drop for SshChild {
     fn drop(&mut self) {
-        let _ = self.0.kill();
-        let _ = self.0.wait();
+        let _ = self.child.kill();
+        let _ = self.child.wait();
     }
 }
 
@@ -296,8 +337,10 @@ fn supervise(
     stop: mpsc::Receiver<()>,
 ) {
     let socket = directory.0.as_ref().map(|dir| dir.join("ssh"));
+    let hosts = config.ssh.hosts();
+    let mut first_host = 0;
     let mut retries = 0;
-    loop {
+    'connection: loop {
         if stopped(&stop, Duration::ZERO) {
             break;
         }
@@ -305,48 +348,75 @@ fn supervise(
             update(&state, "failed", e, retries);
             return;
         }
-        if let Some(socket) = &socket {
-            let _ = fs::remove_file(socket);
-        }
-        let outcome = run_connection(&config, socket.as_deref(), &state, &stop, retries);
-        match outcome {
-            Ok(()) => break,
-            Err((message, was_connected)) => {
-                // Never retry a first authentication/host-key/bind failure. Retry only
-                // an interrupted established connection, or its subsequent recovery.
-                if !config.reconnect.enabled
-                    || (!was_connected && retries == 0)
-                    || retries >= config.reconnect.max_attempts
-                {
-                    update(&state, "failed", message, retries);
-                    return;
+        let mut outcome = ("No SSH address could be reached".to_owned(), false);
+        for offset in 0..hosts.len() {
+            if stopped(&stop, Duration::ZERO) {
+                break 'connection;
+            }
+            let index = (first_host + offset) % hosts.len();
+            let mut candidate = config.clone();
+            candidate.ssh.host = hosts[index].to_owned();
+            update(
+                &state,
+                "connecting",
+                format!(
+                    "Connecting to {}:{} (address {}/{})",
+                    candidate.ssh.host,
+                    candidate.ssh.port,
+                    offset + 1,
+                    hosts.len()
+                ),
+                retries,
+            );
+            if let Some(socket) = &socket {
+                let _ = fs::remove_file(socket);
+            }
+            match run_connection(&candidate, socket.as_deref(), &state, &stop, retries) {
+                Ok(()) => break 'connection,
+                Err((message, was_connected)) => {
+                    outcome = (format!("{}: {message}", candidate.ssh.host), was_connected);
+                    if was_connected {
+                        first_host = (index + 1) % hosts.len();
+                        break;
+                    }
+                    update(&state, "connecting", &outcome.0, retries);
                 }
-                retries += 1;
-                let delay = config
-                    .reconnect
-                    .initial_delay_secs
-                    .saturating_mul(1_u64 << (retries - 1).min(20))
-                    .min(config.reconnect.max_delay_secs);
-                update(
-                    &state,
-                    "reconnecting",
-                    format!(
-                        "{message}; retry {retries}/{} in {delay}s",
-                        config.reconnect.max_attempts
-                    ),
-                    retries,
-                );
-                if stopped(&stop, Duration::from_secs(delay)) {
-                    break;
-                }
-                update(
-                    &state,
-                    "connecting",
-                    "Re-establishing SSH connection…",
-                    retries,
-                );
             }
         }
+        let (message, was_connected) = outcome;
+        // Exhaust the ordered address list once before failing startup.
+        // Reconnection cycles are bounded by the existing retry budget.
+        if !config.reconnect.enabled
+            || (!was_connected && retries == 0)
+            || retries >= config.reconnect.max_attempts
+        {
+            update(&state, "failed", message, retries);
+            return;
+        }
+        retries += 1;
+        let delay = config
+            .reconnect
+            .initial_delay_secs
+            .saturating_mul(1_u64 << (retries - 1).min(20))
+            .min(config.reconnect.max_delay_secs);
+        update(
+            &state,
+            "reconnecting",
+            format!(
+                "{message}; retry {retries}/{} in {delay}s",
+                config.reconnect.max_attempts
+            ),
+            retries,
+        );
+        if stopped(&stop, Duration::from_secs(delay)) {
+            break;
+        }
+        update(
+            &state,
+            "connecting",
+            "Re-establishing SSH connection…",
+            retries,
+        );
     }
     update(
         &state,
@@ -371,7 +441,7 @@ fn run_connection(
         .spawn()
         .map_err(|e| (format!("Cannot start SSH: {e}"), false))?;
     let mut child = SshChild::new(child).map_err(|e| (e, false))?;
-    let stderr = child.0.stderr.take().unwrap();
+    let stderr = child.child.stderr.take().unwrap();
     let logs = state.clone();
     let reader = thread::spawn(move || {
         // take() bounds even a maliciously long server banner; keep draining
@@ -402,7 +472,7 @@ fn run_connection(
         if stopped(stop, Duration::from_millis(200)) {
             break Ok(());
         }
-        match child.0.try_wait() {
+        match child.child.try_wait() {
             Ok(Some(exit)) => {
                 break Err((
                     format!("SSH exited with {exit}; see connection log"),
@@ -413,7 +483,7 @@ fn run_connection(
             _ => {}
         }
         if !connected {
-            let ready = match connection_ready(config, socket, child.0.id()) {
+            let ready = match connection_ready(config, socket, child.child.id()) {
                 Ok(ready) => ready,
                 Err(error) => break Err((error, false)),
             };
@@ -422,9 +492,14 @@ fn run_connection(
                 update(
                     state,
                     "connected",
-                    "SSH authenticated; local listeners ready (service health is not checked)",
+                    format!(
+                        "Connected to {}; local listeners ready (service health is not checked)",
+                        config.ssh.host
+                    ),
                     attempt,
                 );
+                state.lock().unwrap_or_else(|e| e.into_inner()).active_host =
+                    Some(config.ssh.host.clone());
             }
         }
         if !connected && started.elapsed() > Duration::from_secs(20) {

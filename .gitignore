@@ -4,6 +4,8 @@
 **/__pycache__/
 *.pyc
 /services.json
+/dist/
+/client/desktop/src-tauri/gen/
 *.pem
 *.key
 .DS_Store

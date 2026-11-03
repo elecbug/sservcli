@@ -37,6 +37,7 @@ jobs:
       - run: node --check client/desktop/ui/app.js
       - run: npm.cmd ci
         working-directory: client/desktop
+      - run: cargo test --manifest-path client/desktop/src-tauri/Cargo.toml --locked
       - run: npm.cmd run build
         working-directory: client/desktop
       - uses: actions/upload-artifact@v4

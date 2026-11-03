@@ -3,6 +3,7 @@
   "name": "My server",
   "ssh": {
     "host": "server.example.com",
+    "fallback_hosts": [],
     "port": 22,
     "user": "svc_tunnel",
     "identity_file": "~/.ssh/sservcli",

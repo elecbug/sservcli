@@ -331,6 +331,7 @@ def parser():
         sub.add_argument("--user", help="Dedicated account (default: svc_tunnel)")
         if command == "install":
             sub.add_argument("--public-key", required=True)
+            sub.add_argument("--ensure-ssh", action="store_true", help="Generate missing host keys and enable/start the SSH service before installing")
         if command != "render":
             sub.add_argument("--sshd-config", default="/etc/ssh/sshd_config")
             sub.add_argument("--ssh-service", default="ssh")
@@ -354,6 +355,9 @@ def main(argv=None):
         with open("/run/lock/sservcli.lock", "a") as lock:
             fcntl.flock(lock, fcntl.LOCK_EX)
             if args.command == "install":
+                if args.ensure_ssh:
+                    run(["ssh-keygen", "-A"])
+                    run(["systemctl", "enable", "--now", provisioner.service])
                 provisioner.install(user, permitted, args.public_key)
             elif args.command == "remove":
                 provisioner.remove(user)

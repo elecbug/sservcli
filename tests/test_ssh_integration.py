@@ -108,7 +108,7 @@ class SshIntegrationTests(unittest.TestCase):
         self.cli_log_path = self.directory / "client.log"
         log = self.cli_log_path.open("w")
         self.addCleanup(log.close)
-        self.cli = subprocess.Popen([str(self.binary), "connect", "--config", str(path)], stderr=log, stdout=subprocess.DEVNULL)
+        self.cli = subprocess.Popen([str(self.binary), "connect", "--config", str(path)], stderr=log, stdout=subprocess.DEVNULL, env=getattr(self, "cli_env", None))
         self.addCleanup(self.stop_client)
 
     def stop_client(self):
@@ -157,6 +157,95 @@ class SshIntegrationTests(unittest.TestCase):
         self.assertNotEqual(self.cli.returncode, 0)
         self.assertIn("Host key verification failed", self.cli_log_path.read_text())
         self.assertEqual((self.directory / "known_hosts").read_text(), "")
+
+    def use_pinned_key(self, name="host"):
+        self.profile["ssh"].pop("known_hosts_file", None)
+        self.profile["ssh"]["host_public_key"] = (self.directory / f"{name}.pub").read_text()
+
+    def test_supplied_host_key_needs_no_known_hosts_file_and_is_cleaned_up(self):
+        self.use_pinned_key()
+        (self.directory / "known_hosts").unlink()
+        self.start_client()
+        self.connected()
+        service = self.profile["services"][0]
+        with socket.create_connection(("127.0.0.1", service["local_port"]), timeout=3) as sock:
+            sock.sendall(b"pinned")
+            self.assertEqual(sock.recv(1024), b"service-0:pinned")
+        self.assertIn("[pinned host key] SHA256:", self.cli_log_path.read_text())
+        self.assertFalse((self.directory / "known_hosts").exists())
+        self.stop_client()
+        self.assertEqual(list(Path(tempfile.gettempdir()).glob(f"sservcli-host-{self.cli.pid}-*")), [])
+
+    def test_wrong_supplied_host_key_is_rejected(self):
+        self.use_pinned_key("wrong_host")
+        self.start_client()
+        self.cli.wait(timeout=10)
+        self.assertNotEqual(self.cli.returncode, 0)
+        self.assertIn("HOST IDENTIFICATION HAS CHANGED", self.cli_log_path.read_text())
+        self.assertNotIn("[connected]", self.cli_log_path.read_text())
+
+    def test_host_key_does_not_grant_client_authentication(self):
+        self.use_pinned_key()
+        self.profile["ssh"]["identity_file"] = str(self.directory / "wrong_host")
+        self.start_client()
+        self.cli.wait(timeout=10)
+        self.assertNotEqual(self.cli.returncode, 0)
+        self.assertIn("Permission denied", self.cli_log_path.read_text())
+        self.assertNotIn("[connected]", self.cli_log_path.read_text())
+
+    def test_existing_agent_works_with_a_supplied_server_key(self):
+        agent_socket = self.directory / "agent.sock"
+        agent = subprocess.Popen(["ssh-agent", "-D", "-a", str(agent_socket)], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        def stop_agent():
+            agent.terminate()
+            agent.wait(timeout=5)
+        self.addCleanup(stop_agent)
+        wait_for(agent_socket.exists)
+        self.cli_env = {**os.environ, "SSH_AUTH_SOCK": str(agent_socket)}
+        subprocess.run(["ssh-add", str(self.directory / "identity")], env=self.cli_env, capture_output=True, check=True)
+        self.use_pinned_key()
+        self.profile["ssh"]["identity_file"] = None
+        self.start_client()
+        self.connected()
+
+    def test_fallback_addresses_are_tried_in_order_with_the_same_pinned_key(self):
+        self.use_pinned_key()
+        self.profile["ssh"]["host"] = "127.0.0.2"
+        self.profile["ssh"]["fallback_hosts"] = ["127.0.0.3", "127.0.0.1"]
+        self.start_client()
+        self.connected()
+        log = self.cli_log_path.read_text()
+        self.assertLess(log.index("127.0.0.2"), log.index("127.0.0.3"))
+        self.assertIn("Connected to 127.0.0.1", log)
+        self.assertEqual(self.daemon_log_path.read_text().count("Accepted publickey"), 1)
+
+    def test_fallback_never_accepts_a_different_server_key(self):
+        self.use_pinned_key("wrong_host")
+        self.profile["ssh"]["host"] = "127.0.0.2"
+        self.profile["ssh"]["fallback_hosts"] = ["127.0.0.1"]
+        self.start_client()
+        self.cli.wait(timeout=10)
+        self.assertNotEqual(self.cli.returncode, 0)
+        self.assertIn("HOST IDENTIFICATION HAS CHANGED", self.cli_log_path.read_text())
+        self.assertNotIn("[connected]", self.cli_log_path.read_text())
+
+    def test_init_generates_a_usable_profile_and_never_overwrites_one(self):
+        path = self.directory / "new-profile.json"
+        service = self.profile["services"][0]
+        command = [str(self.binary), "init", "--config", str(path), "--host", "127.0.0.1", "--port", str(self.port),
+                   "--user", self.user, "--host-key", str(self.directory / "host.pub"), "--identity", str(self.directory / "identity"),
+                   "--remote-port", str(service["remote_port"]), "--local-port", str(service["local_port"])]
+        result = subprocess.run(command, text=True, capture_output=True)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("Pinned server host key: SHA256:", result.stdout)
+        self.profile = json.loads(path.read_text())
+        self.assertNotIn("known_hosts_file", self.profile["ssh"])
+        previous = path.read_bytes()
+        result = subprocess.run(command, text=True, capture_output=True)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertEqual(path.read_bytes(), previous)
+        self.start_client()
+        self.connected()
 
     def test_dropped_transport_reconnects(self):
         if not Path("/proc/self").exists():

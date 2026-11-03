@@ -10,20 +10,26 @@ static STOP: AtomicBool = AtomicBool::new(false);
 static CLEANED_UP: AtomicBool = AtomicBool::new(false);
 
 pub(crate) fn ssh_command() -> Command {
+    openssh_command("ssh")
+}
+
+pub(crate) fn openssh_command(program: &str) -> Command {
     #[cfg(windows)]
     {
         use std::os::windows::process::CommandExt;
         // Prefer native OpenSSH over Git/WSL wrappers that may start another
         // process or expect a different agent and path syntax.
         let native = std::env::var_os("SystemRoot")
-            .map(|root| std::path::PathBuf::from(root).join("System32/OpenSSH/ssh.exe"))
+            .map(|root| {
+                std::path::PathBuf::from(root).join(format!("System32/OpenSSH/{program}.exe"))
+            })
             .filter(|path| path.is_file());
-        let mut command = Command::new(native.unwrap_or_else(|| "ssh.exe".into()));
+        let mut command = Command::new(native.unwrap_or_else(|| format!("{program}.exe").into()));
         command.creation_flags(0x0800_0000); // CREATE_NO_WINDOW
         command
     }
     #[cfg(not(windows))]
-    Command::new("ssh")
+    Command::new(program)
 }
 
 /// OpenSSH accepts Windows drive/UNC paths using forward slashes, without the
