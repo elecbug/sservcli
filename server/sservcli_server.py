@@ -647,6 +647,15 @@ def token_command(args, provisioner, preferred, permitted):
                 record["last_token_sha256"] = digest
                 atomic_write(provisioner.state_path(user), json.dumps(record, indent=2) + "\n")
                 receipt["token"] = token
+            if not account_lock:
+                record = json.loads(provisioner.state_path(user).read_text())
+                active = False
+                with open(f"/run/lock/sservcli-token-{user}.lock", "a") as probe:
+                    try:
+                        fcntl.flock(probe, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                    except BlockingIOError:
+                        active = True
+                receipt.update(token_active=active, token_sha256=record.get("last_token_sha256"))
             receipt.update(host_public_key=public, requested_user=preferred)
         print(json.dumps(receipt), flush=True)
         if account_lock:

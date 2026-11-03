@@ -1,4 +1,4 @@
-# Python-only server provisioning, client, packaging, and checks.
+# Go client; Python server provisioning and packaging. Native OpenSSH transport.
 SHELL := /bin/bash
 .SHELLFLAGS := -euo pipefail -c
 .DEFAULT_GOAL := help
@@ -14,34 +14,38 @@ VENV_DIR ?= .venv
 VENV_PYTHON = $(VENV_DIR)/bin/python
 RUN_PYTHON = $(if $(wildcard $(VENV_PYTHON)),$(VENV_PYTHON),$(PYTHON))
 SERVER_STATE ?= var/server
+GO ?= go
+TOKEN_FILE ?= .token
+BUILD_CLIENT ?= 1
+WINDOWS_ARCH ?= amd64
 
 export TUNNEL_USER PUBKEY_FILE PERMIT_OPEN SSHD_CONFIG SSH_SERVICE CONFIG
-export HOST_KEY_FILE BUNDLE_OUTPUT DRY_RUN
-export SERVER_STATE TOKEN_PORT LEGACY_SSH
+export HOST_KEY_FILE BUNDLE_OUTPUT DRY_RUN BUNDLE_TOKEN_FILE
+export SERVER_STATE TOKEN_PORT LEGACY_SSH BUILD_CLIENT WINDOWS_ARCH
 
-.PHONY: help setup server create delete audit render build check test integration desktop bundle bundle-windows client-zip
+.PHONY: help setup server-setup server create delete audit render build build-windows check test integration client bundle bundle-windows client-zip
 
 help:
 	@printf '%s\n' \
-	  'make setup                           Check Python and native OpenSSH (no pip dependencies)' \
-	  'make server CONFIG=services.json     Issue an SSH password token using the existing sshd (sudo)' \
-	  'make check                           Validate Python sources and example profiles' \
-	  'make test                            Run Python unit tests (no account changes)' \
-	  'make integration                     Run temporary local sshd integration tests' \
-	  'make desktop [CONFIG=services.json]   Run the Tkinter client' \
-	  'make build                           Check sources; no compilation is needed' \
-	  'make bundle CONFIG=services.json     Prepare/reuse restricted SSH account; create Windows ZIP' \
-	  'make bundle LEGACY_SSH=1 PUBKEY_FILE=<client.pub> CONFIG=<services.json>  Old account/key workflow' \
-	  'make client-zip CONFIG=<services.json> Package client only; preserve existing server accounts' \
-	  'make render CONFIG=services.json      Preview server SSH policy' \
-	  'sudo make create PUBKEY_FILE=<client.pub> [TUNNEL_USER=svc_tunnel]' \
-	  'sudo make audit [TUNNEL_USER=svc_tunnel]' \
-	  'sudo make delete [TUNNEL_USER=svc_tunnel]'
+	  'make server CONFIG=services.json     Issue a token for the existing system sshd (Python/sudo)' \
+	  'make build                           Build the Go client for this OS' \
+	  'make build-windows                   Cross-compile dist/sservcli.exe (no CGO)' \
+	  'make client CONFIG=services.json     Start the Go client and localhost:8000 management page' \
+	  'make bundle CONFIG=services.json     Prepare SSH account and create a Windows EXE/source ZIP' \
+	  'make bundle CONFIG=services.json BUILD_CLIENT=0  Source ZIP; build later with Build.cmd' \
+	  'make bundle LEGACY_SSH=1 PUBKEY_FILE=<client.pub> CONFIG=<services.json>  Key/Agent mode' \
+	  'make client-zip CONFIG=<final-profile.json>  ZIP without server/account changes' \
+	  'make check test                      Validate Go/Python and run unit tests' \
+	  'make integration                     Run isolated native ssh/sshd tests' \
+	  'make render CONFIG=services.json     Preview restricted SSH policy'
 
 setup:
-	"$(RUN_PYTHON)" -c 'import sys; assert sys.version_info >= (3, 11), "Python 3.11+ required"; from sservcli.tunnel import openssh_program; print("Python and native OpenSSH ready:", openssh_program())'
+	$(GO) version
 
-server: setup
+server-setup:
+	"$(RUN_PYTHON)" -c 'import sys, shutil; assert sys.version_info >= (3, 11), "Python 3.11+ required"; assert shutil.which("ssh"), "Install OpenSSH"'
+
+server: server-setup
 	"$(RUN_PYTHON)" -m sservcli serve --config "$$CONFIG" --state-dir "$$SERVER_STATE"
 
 create:
@@ -57,26 +61,33 @@ audit:
 render:
 	@$(PYTHON) server/sservcli_server.py render --config "$$CONFIG"
 
-build: check
+build: setup
+	cd client && CGO_ENABLED=0 $(GO) build -trimpath -o sservcli ./cmd/sservcli
 
-check: setup
+build-windows: setup
+	mkdir -p dist
+	cd client && GOOS=windows GOARCH=$(WINDOWS_ARCH) CGO_ENABLED=0 $(GO) build -trimpath -ldflags='-s -w' -o ../dist/sservcli.exe ./cmd/sservcli
+	cd client && GOOS=windows GOARCH=$(WINDOWS_ARCH) CGO_ENABLED=0 $(GO) build -trimpath -ldflags='-s -w -H=windowsgui' -o ../dist/sservcli-askpass.exe ./cmd/askpass
+
+check: setup server-setup
 	"$(RUN_PYTHON)" -m compileall -q sservcli server tools tests
-	"$(RUN_PYTHON)" -m sservcli check --config examples/services.token.json
-	"$(RUN_PYTHON)" -m sservcli check --config examples/services.token.windows.json
+	"$(RUN_PYTHON)" -c 'from sservcli.config import load_profile; load_profile("examples/services.token.json"); load_profile("examples/services.token.windows.json")'
 	"$(RUN_PYTHON)" server/sservcli_server.py render --config examples/services.token.json >/dev/null
+	cd client && $(GO) vet ./...
 
-test: setup
+test: setup server-setup
 	"$(RUN_PYTHON)" -m unittest discover -s tests -v
+	cd client && $(GO) test ./...
 
-integration: setup
+integration: build server-setup
 	SSERVCLI_SSH_TESTS=1 "$(RUN_PYTHON)" -m unittest discover -s tests -p test_ssh_integration.py -v
 	SSERVCLI_SSH_TESTS=1 "$(RUN_PYTHON)" -m unittest discover -s tests -p test_token_ssh.py -v
 
-desktop: setup
-	"$(RUN_PYTHON)" -m sservcli desktop --config "$$CONFIG"
+client: build
+	client/sservcli start --config "$$CONFIG" --token-file "$(TOKEN_FILE)"
 
-bundle bundle-windows: setup
+bundle bundle-windows: server-setup
 	"$(RUN_PYTHON)" tools/bundle_windows.py
 
-client-zip: setup
+client-zip:
 	"$(RUN_PYTHON)" tools/bundle_windows.py --client-only

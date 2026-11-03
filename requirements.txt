@@ -1,1 +1,1 @@
-# No third-party Python packages. Transport uses the installed OpenSSH ssh/sshd.
+# The Python server/provisioner has no third-party packages. The client is Go.

@@ -1,10 +1,8 @@
 """Shared, strict profile validation and path handling (standard library only)."""
 import copy
 import json
-import os
 from pathlib import Path
 import re
-import tempfile
 
 
 class ConfigError(ValueError):
@@ -12,7 +10,7 @@ class ConfigError(ValueError):
 
 
 def validate_profile(config):
-    """Validate the shared profile schema for the client, server bundle, and GUI."""
+    """Validate service profiles for server provisioning and Go client packaging."""
     def fields(value, allowed, required, label):
         if not isinstance(value, dict) or set(value) - set(allowed) or set(required) - set(value):
             raise ConfigError(f"Invalid or unknown fields in {label}")
@@ -94,10 +92,6 @@ def validate_profile(config):
                     raise ConfigError("Unknown launch placeholder")
 
 
-def resolve_path(value, directory):
-    path = Path(value).expanduser()
-    return str(path if path.is_absolute() else (Path(directory) / path).resolve())
-
 
 def load_profile(path):
     path = Path(path).expanduser().resolve()
@@ -107,50 +101,6 @@ def load_profile(path):
     validate_profile(config)
     return config
 
-
-def resolved_profile(config, path):
-    validate_profile(config)
-    result = copy.deepcopy(config)
-    for name in ("identity_file", "known_hosts_file"):
-        if result["ssh"].get(name):
-            result["ssh"][name] = resolve_path(result["ssh"][name], Path(path).resolve().parent)
-    return result
-
-
-def save_profile(path, config, *, exclusive=False):
-    validate_profile(config)
-    path = Path(path).expanduser().resolve()
-    text = json.dumps(config, indent=2, ensure_ascii=False) + "\n"
-    if exclusive:
-        descriptor = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
-        with os.fdopen(descriptor, "w", encoding="utf-8") as output:
-            output.write(text)
-        return
-    descriptor, temporary = tempfile.mkstemp(prefix=".sservcli-", dir=path.parent)
-    try:
-        with os.fdopen(descriptor, "w", encoding="utf-8") as output:
-            output.write(text)
-            output.flush()
-            os.fsync(output.fileno())
-        os.replace(temporary, path)
-    finally:
-        if os.path.exists(temporary):
-            os.unlink(temporary)
-
-
-def endpoint(service):
-    return f"127.0.0.1:{service['local_port']}"
-
-
-def service_url(service):
-    return f"{service.get('scheme', 'http')}://{endpoint(service)}{service.get('path', '/')}"
-
-
-def launch_arguments(service):
-    if not service.get("launch"):
-        return None
-    replacements = {"host": "127.0.0.1", "port": str(service["local_port"]), "url": service_url(service)}
-    return [arg.format_map(replacements) for arg in service["launch"]]
 
 
 def token_profile(config, port=None):

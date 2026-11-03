@@ -1,12 +1,14 @@
 #!/usr/bin/env python3
-"""Prepare a Python Windows client ZIP and provision a forwarding account locally.
+"""Prepare a Go Windows client ZIP and provision a forwarding account locally.
 
 Token mode prepares a restricted system OpenSSH account and embeds its public
 host key. The optional legacy mode registers an existing client public key.
-Neither private keys nor shared tokens enter the bundle.
+Private keys stay on the server/client. Token bundles include the current startup token as .token.
 """
 import argparse
 import hashlib
+import hmac
+import stat
 import importlib.util
 import json
 import os
@@ -19,7 +21,8 @@ import zipfile
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
-from sservcli.config import ConfigError, load_profile, token_profile, validate_profile
+from sservcli.config import ConfigError, load_profile, token_profile, validate_profile, validate_token
+from sservcli.token_auth import read_private
 server = None
 if os.name == "posix":
     spec = importlib.util.spec_from_file_location("sservcli_server", ROOT / "server/sservcli_server.py")
@@ -31,8 +34,8 @@ LegacySetupError = server.SetupError if server else ConfigError
 BundleError = ConfigError
 
 
-def run(argv, *, timeout=3600):
-    result = subprocess.run([str(arg) for arg in argv], text=True, capture_output=True, timeout=timeout)
+def run(argv, *, timeout=3600, cwd=None, env=None):
+    result = subprocess.run([str(arg) for arg in argv], text=True, capture_output=True, timeout=timeout, cwd=cwd, env=env)
     if result.returncode:
         raise BundleError(f"{argv[0]} failed: {result.stderr.strip() or result.stdout.strip()}")
     return result.stdout
@@ -40,11 +43,10 @@ def run(argv, *, timeout=3600):
 
 def source_files(root=ROOT):
     """Explicit runtime allowlist: never walk arbitrary directories or key files."""
-    required = ["Build.cmd", "Start.cmd", "README.md", "requirements.txt",
+    required = ["Build.cmd", "Start.cmd", "Stop.cmd", "README.md", "client/go.mod", "client/cmd/sservcli/main.go", "client/cmd/askpass/main.go",
                 "examples/services.token.json", "examples/services.token.windows.json"]
-    required += [f"sservcli/{name}.py" for name in (
-        "__init__", "__main__", "config", "tunnel", "desktop", "instance", "windows", "windows_launcher",
-        "token_auth", "token_server", "askpass")]
+    required += [f"client/internal/app/{name}.go" for name in (
+        "config", "tunnel", "daemon", "dashboard", "main", "platform_unix", "platform_windows", "process_linux", "process_other")]
     files = {}
     for name in required:
         path = root / name
@@ -65,7 +67,12 @@ def write_archive(output, files, directory):
     archive = Path(directory) / "client.zip"
     with zipfile.ZipFile(archive, "w", compression=zipfile.ZIP_DEFLATED) as stream:
         for name, data in files.items():
-            stream.writestr(name, data)
+            entry = zipfile.ZipInfo(name)
+            entry.compress_type = zipfile.ZIP_DEFLATED
+            entry.external_attr = (stat.S_IFREG | (0o600 if name == ".token" else 0o644)) << 16
+            stream.writestr(entry, data)
+    if ".token" in files:
+        archive.chmod(0o600)
     # Keep previous downloads and handle competing publishers without clobbering.
     index = 1
     while True:
@@ -79,22 +86,57 @@ def write_archive(output, files, directory):
     return candidate
 
 
-def client_archive(config, inputs):
+def build_client(args):
+    if args.source_only:
+        return {}
+    import shutil
+    go = shutil.which("go")
+    if not go:
+        raise BundleError("Install Go to build the Windows EXE, or use BUILD_CLIENT=0 for a source ZIP")
+    binaries = {}
+    with tempfile.TemporaryDirectory(prefix="sservcli-go-build-") as temporary:
+        environment = {**os.environ, "GOOS": "windows", "GOARCH": args.arch, "CGO_ENABLED": "0", "GOWORK": "off"}
+        for name, package, flags in (("sservcli.exe", "./cmd/sservcli", "-s -w"),
+                                     ("sservcli-askpass.exe", "./cmd/askpass", "-s -w -H=windowsgui")):
+            output = Path(temporary) / name
+            run([go, "build", "-trimpath", "-ldflags=" + flags, "-o", output, package],
+                cwd=ROOT / "client", env=environment)
+            data = output.read_bytes()
+            if not data.startswith(b"MZ"):
+                raise BundleError("Go did not produce a Windows executable")
+            binaries[name] = data
+    return binaries
+
+
+def client_archive(config, inputs, token=None):
     validate_profile(config)
     files = {**inputs, "services.json": (json.dumps(config, indent=2) + "\n").encode(),
-             "README.txt": ("sservcli Python Windows client\r\n\r\n"
-                "Extract the entire ZIP under your Windows user account.\r\n"
-                "Install Python 3.11+ with Tcl/Tk and the Python launcher, and enable Windows OpenSSH Client.\r\n"
-                "Run Build.cmd to check prerequisites, then run Start.cmd. No pip dependencies or compilation are needed.\r\n"
-                + ("Enter the current case-sensitive 8-character token shown by make server. It is not included in this ZIP.\r\n" if config["version"] == 2 else
-                   "This is a legacy SSH-key profile: enable OpenSSH Client and use the authorized private key/Agent.\r\n") +
-                "All enabled services connect automatically. Click the tray icon to show services. Tray > Quit stops SSH.\r\n"
-                "Closing the window keeps forwarding in the Windows tray; on other platforms it minimizes the window.\r\n"
-                "services.json supplies the host key, fallback addresses, and services.\r\n"
-                "No private keys or shared tokens are included. See README.md for configuration and troubleshooting.\r\n").encode()}
+             "README.txt": ("sservcli Go Windows client\r\n\r\n"
+                "Extract the entire ZIP under your Windows user account. Enable Windows OpenSSH Client.\r\n"
+                "A bundled sservcli.exe needs neither Python nor Go installed.\r\n"
+                "If the EXE is absent, install Go and run Build.cmd once.\r\n"
+                + ("The current case-sensitive 8-character startup token is included in .token beside sservcli.exe.\r\n" if config["version"] == 2 else
+                   "This key/Agent profile uses your existing authorized private key.\r\n") +
+                "Run Start.cmd. All enabled services forward in the background.\r\n"
+                "Open http://127.0.0.1:8000 for status, service addresses, connect/disconnect, and configuration.\r\n"
+                "Run Stop.cmd or sservcli.exe stop to release all forwards. Closing the browser keeps SSH running.\r\n"
+                "sservcli.exe list shows the service catalog. services.json and .token are read beside the EXE.\r\n"
+                "Keep this ZIP private: .token grants forwarding access. Restarting make server requires a new token/ZIP.\r\n"
+                "No private keys or Python files are included. See README.md for details.\r\n").encode()}
+    if config["version"] == 2:
+        files[".token"] = (validate_token(token) + "\n").encode("ascii")
     if config["ssh"].get("host_public_key"):
         files["server-host-key.pub"] = (config["ssh"]["host_public_key"].strip() + "\n").encode()
     return files
+
+
+def archive_inputs(args):
+    inputs = source_files()
+    if not args.dry_run:
+        executable = build_client(args)
+        if executable:
+            inputs.update(executable)
+    return inputs
 
 
 def server_command(args, operation, profile=None):
@@ -140,23 +182,24 @@ def package(args):
         raise BundleError("Set PUBKEY_FILE to the existing Windows client's Ed25519 PUBLIC key; private keys are never packaged")
     if args.client_only:
         config = load_profile(args.config)
-        output = (args.output or ROOT / "dist/sservcli-windows-python.zip").absolute()
-        inputs = source_files()
+        output = (args.output or ROOT / "dist/sservcli-windows-go.zip").absolute()
+        token = bundle_token(args, config) if not args.dry_run else None
+        inputs = archive_inputs(args)
         if args.dry_run:
-            print("Dry run: client profile and Python runtime files validated; would publish:", output)
+            print("Dry run: client profile and Go client source files validated; would publish:", output)
             return None
         output.parent.mkdir(parents=True, exist_ok=True)
         with tempfile.TemporaryDirectory(prefix=".sservcli-client-", dir=output.parent) as directory:
-            output = write_archive(output, client_archive(config, inputs), directory)
-        print("Python client ZIP ready:", output)
+            output = write_archive(output, client_archive(config, inputs, token), directory)
+        print("Go client ZIP ready:", output)
         return output
     config = profile_for(args)
-    output = (args.output or ROOT / f"dist/sservcli-windows-{args.user}-python.zip").absolute()
+    output = (args.output or ROOT / f"dist/sservcli-windows-{args.user}-go.zip").absolute()
     output.parent.mkdir(parents=True, exist_ok=True)
     created = False
     with tempfile.TemporaryDirectory(prefix=".sservcli-bundle-", dir=output.parent) as scratch:
         directory = Path(scratch)
-        inputs = source_files()
+        inputs = archive_inputs(args)
         # Validate and gather build inputs before privileged account changes.
         policy_profile = directory / "server-policy.json"
         policy_profile.write_text(json.dumps(config), encoding="utf-8")
@@ -194,19 +237,31 @@ def package(args):
                 except (BundleError, OSError) as error:
                     print(f"Account rollback failed; administrator recovery required: {error}", file=sys.stderr)
             raise
-    print(f"Windows bundle ready: {output}\nDownload this ZIP to Windows, extract it, and run Start.cmd (Python 3.11+ with Tkinter and OpenSSH Client required). No client private key was copied.")
+    print(f"Windows bundle ready: {output}\nDownload this ZIP to Windows, extract it, and run Start.cmd (Windows OpenSSH Client required). No client private key was copied.")
     return output
+
+
+def bundle_token(args, config):
+    if config["version"] != 2:
+        return None
+    adjacent = args.config.parent / ".token"
+    path = args.token_file or (adjacent if args.client_only and adjacent.exists() else args.state_dir / "access.token")
+    try:
+        return validate_token(read_private(path).rstrip("\r\n"))
+    except (OSError, ValueError) as error:
+        raise BundleError(f"Cannot read current token from {path}; keep make server running or set BUNDLE_TOKEN_FILE to a private token file") from error
 
 
 def package_token(args):
     config = token_profile(load_profile(args.config), args.token_port)
     if config["ssh"]["host"] == "server.example.com":
         raise BundleError("Set ssh.host in CONFIG to the server's reachable IP or hostname")
-    inputs = source_files()
+    token = bundle_token(args, config) if not args.dry_run else None
+    inputs = archive_inputs(args)
     output = (args.output or ROOT / "dist/sservcli-windows-token.zip").absolute()
     if args.dry_run:
         print("Dry run: would create/reuse a restricted OpenSSH password account and pin the existing sshd public host key.")
-        print("Would publish:", output, "(numeric suffix if it exists). No shared token is issued or packaged.")
+        print("Would publish:", output, "(numeric suffix if it exists). The current running token will be included as .token; no new token is issued.")
         return None
     if server is None:
         raise BundleError("Prepare the server account on Ubuntu/OpenSSH; use --client-only to repackage a final client profile elsewhere")
@@ -217,11 +272,14 @@ def package_token(args):
         receipt = json.loads(run(server_command(args, "token-prepare", profile_path)))
         if not isinstance(receipt, dict) or not isinstance(receipt.get("user"), str) or not isinstance(receipt.get("host_public_key"), str):
             raise BundleError("Invalid OpenSSH preparation response")
+        if (receipt.get("token_active") is not True or not isinstance(receipt.get("token_sha256"), str)
+                or not hmac.compare_digest(receipt["token_sha256"], hashlib.sha256(token.encode()).hexdigest())):
+            raise BundleError("No matching active startup token. Keep make server running with the same CONFIG/SERVER_STATE, then run bundle again")
         server.username(receipt["user"])
         config["ssh"].update(user=receipt["user"], host_public_key=receipt["host_public_key"])
         validate_profile(config)
-        output = write_archive(output, client_archive(config, inputs), directory)
-    print(f"OpenSSH token client ZIP ready: {output}\nRun Start.cmd on Windows and enter the 8-character token printed by make server. The token was not packaged.")
+        output = write_archive(output, client_archive(config, inputs, token), directory)
+    print(f"OpenSSH token client ZIP ready: {output}\nThe current startup token is included as .token. Extract the whole ZIP and run Start.cmd on Windows.")
     return output
 
 
@@ -234,6 +292,10 @@ def parser():
     result.add_argument("--host-key", type=Path, default=Path(env.get("HOST_KEY_FILE") or "/etc/ssh/ssh_host_ed25519_key.pub"))
     result.add_argument("--client-only", action="store_true", help="Package an existing client profile without account changes or PUBKEY_FILE")
     result.add_argument("--legacy-ssh", action="store_true", default=env.get("LEGACY_SSH") == "1", help="Use the old OS-account/public-key provisioning workflow")
+    result.add_argument("--token-file", type=Path, default=Path(env["BUNDLE_TOKEN_FILE"]) if env.get("BUNDLE_TOKEN_FILE") else None,
+                        help="Current token to include; defaults to SERVER_STATE/access.token (client-only also checks adjacent .token)")
+    result.add_argument("--source-only", action="store_true", default=env.get("BUILD_CLIENT") == "0", help="Package Go sources without compiling an EXE")
+    result.add_argument("--arch", choices=("amd64", "arm64"), default=env.get("WINDOWS_ARCH") or "amd64")
     result.add_argument("--state-dir", type=Path, default=Path(env.get("SERVER_STATE") or ROOT / "var/server"))
     result.add_argument("--token-port", type=int, default=int(env["TOKEN_PORT"]) if env.get("TOKEN_PORT") else None)
     result.add_argument("--output", type=Path, default=Path(env["BUNDLE_OUTPUT"]) if env.get("BUNDLE_OUTPUT") else None)

@@ -416,6 +416,33 @@ class TransactionTests(unittest.TestCase):
         self.assertEqual(self.commands[-2:], [["usermod", "--lock", "svc_tunnel"], ["pkill", "-KILL", "-u", str(receipt["uid"])]])
         self.assertNotIn(receipt["token"], self.p.state_path("svc_tunnel").read_text())
 
+    def test_bundle_receipt_checks_live_token_lease_without_issuing_a_token(self):
+        self.p.ensure_token("svc_tunnel", ["127.0.0.1:8080"])
+        path = self.p.state_path("svc_tunnel")
+        record = json.loads(path.read_text())
+        record["last_token_sha256"] = "a" * 64
+        path.write_text(json.dumps(record))
+        args = SimpleNamespace(command="token-prepare", ensure_ssh=False, host_key="ignored.pub")
+        lock_path = self.p.home_base.parent / "live-token.lock"
+        with builtins.open(lock_path, "a") as lease:
+            server.fcntl.flock(lease, server.fcntl.LOCK_EX | server.fcntl.LOCK_NB)
+            for active in (True, False):
+                if not active:
+                    server.fcntl.flock(lease, server.fcntl.LOCK_UN)
+                output = io.StringIO()
+                with (patch.object(server, "management_lock", side_effect=contextlib.nullcontext),
+                      patch.object(server, "host_public_key", return_value="ssh-ed25519 public"),
+                      patch.object(server, "open", side_effect=lambda *a, **kw: builtins.open(lock_path, "a"), create=True),
+                      patch.object(self.p, "set_token") as password,
+                      contextlib.redirect_stdout(output)):
+                    server.token_command(args, self.p, "svc_tunnel", ["127.0.0.1:8080"])
+                receipt = json.loads(output.getvalue())
+                self.assertEqual(receipt["token_active"], active)
+                self.assertEqual(receipt["token_sha256"], "a" * 64)
+                self.assertNotIn("token", receipt)
+                password.assert_not_called()
+
+
 
 if __name__ == "__main__":
     unittest.main()

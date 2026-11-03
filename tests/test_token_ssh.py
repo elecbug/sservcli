@@ -16,8 +16,10 @@ import time
 import unittest
 from unittest.mock import patch
 
-from sservcli.askpass import environment
-from sservcli.tunnel import Tunnel
+import copy
+import re
+import urllib.request
+import urllib.error
 
 ROOT = Path(__file__).resolve().parents[1]
 spec = importlib.util.spec_from_file_location('provision', ROOT / 'server/sservcli_server.py')
@@ -38,6 +40,48 @@ def wait_for(predicate, timeout=12):
             return
         time.sleep(.05)
     raise AssertionError('Timed out waiting for native OpenSSH state')
+
+
+CLIENT = Path(os.environ.get("SSERVCLI_CLIENT", str(ROOT / "client/sservcli")))
+
+def environment(token, directory):
+    return {**os.environ, "SSH_ASKPASS": str(CLIENT), "SSH_ASKPASS_REQUIRE": "force", "DISPLAY": "sservcli:0",
+            "SSERVCLI_ASKPASS_MODE": "1", "SSERVCLI_ASKPASS_TOKEN": token}
+
+
+class GoTunnel:
+    """Subprocess harness: all transport/authentication code runs in Go/OpenSSH."""
+    def __init__(self, directory):
+        self.directory = directory
+        self.process = self.log = None
+        self.log_path = directory / "go-client.log"
+
+    def connect(self, profile, token):
+        self.disconnect()
+        config = self.directory / "go-services.json"
+        config.write_text(json.dumps(profile))
+        token_file = self.directory / ".token"
+        token_file.write_text(token)
+        token_file.chmod(0o600)
+        self.log = self.log_path.open("w")
+        self.process = subprocess.Popen([str(CLIENT), "connect", "--config", str(config), "--token-file", str(token_file)],
+                                        stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=self.log)
+
+    def snapshot(self):
+        logs = self.log_path.read_text() if self.log_path.exists() else ""
+        events = re.findall(r'^\[(connecting|connected|reconnecting|failed|disconnected)\] (.*)$', logs, re.M)
+        status, message = events[-1] if events else ("connecting", "Starting")
+        active = re.search(r"Connected to ([^;]+);", message)
+        return {"status": status, "message": message, "logs": logs.splitlines(),
+                "attempt": logs.count("[reconnecting]"), "active_host": active[1] if active else None}
+
+    def disconnect(self):
+        if self.process and self.process.poll() is None:
+            self.process.terminate()
+            self.process.wait(timeout=8)
+        if self.log:
+            self.log.close()
+            self.log = None
 
 
 class Echo(socketserver.BaseRequestHandler):
@@ -104,7 +148,7 @@ class NativeTokenSshTests(unittest.TestCase):
                                        env=self.daemon_env, stdout=subprocess.DEVNULL, stderr=log, start_new_session=True)
         self.addCleanup(self.stop_daemon)
         wait_for(lambda: 'Server listening' in self.log_path.read_text())
-        self.tunnel = Tunnel()
+        self.tunnel = GoTunnel(self.directory)
         self.addCleanup(self.tunnel.disconnect)
 
     def set_password(self, token=None, *, locked=False):
@@ -189,20 +233,13 @@ class NativeTokenSshTests(unittest.TestCase):
         self.roundtrip()
 
     def test_reconnect_still_spawns_the_native_ssh_program(self):
-        real = subprocess.Popen
-        children = []
-        def spawn(argv, *args, **kwargs):
-            child = real(argv, *args, **kwargs)
-            if '-N' in argv:
-                children.append(child)
-            return child
-        with patch('sservcli.tunnel.subprocess.Popen', side_effect=spawn):
-            self.connect()
-            self.assertEqual(len(children), 1)
-            children[0].terminate()
-            wait_for(lambda: self.log_path.read_text().count('Accepted password') >= 2 and self.tunnel.snapshot()['status'] == 'connected')
-            self.assertEqual(len(children), 2)
-            self.roundtrip()
+        self.connect()
+        children = [pid for path in Path(f"/proc/{self.tunnel.process.pid}/task").glob("*/children") for pid in path.read_text().split()]
+        self.assertEqual(len(children), 1)
+        self.assertEqual(Path(f"/proc/{children[0]}/exe").resolve().name, "ssh")
+        os.kill(int(children[0]), signal.SIGTERM)
+        wait_for(lambda: self.log_path.read_text().count('Accepted password') >= 2 and self.tunnel.snapshot()['status'] == 'connected')
+        self.roundtrip()
 
     def test_shell_and_remote_forwarding_remain_denied(self):
         known = self.directory / 'known_hosts'
@@ -224,6 +261,64 @@ class NativeTokenSshTests(unittest.TestCase):
             stream.sendall(b'forbidden')
             with contextlib.suppress(ConnectionResetError):
                 self.assertEqual(stream.recv(1024), b'')
+
+    def test_background_client_reads_adjacent_files_and_serves_local_management(self):
+        # Copy the executable: defaults must follow its directory, not the cwd.
+        local_client = self.directory / "sservcli"
+        shutil.copy2(CLIENT, local_client)
+        (self.directory / "services.json").write_text(json.dumps(self.profile))
+        (self.directory / ".token").write_text(self.secret + "\n")
+        (self.directory / ".token").chmod(0o600)
+        web_port = free_port()
+        command = [str(local_client)]
+        result = subprocess.run([*command, "start", "--web-port", str(web_port)], cwd="/tmp", capture_output=True, text=True, timeout=12)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        def stop():
+            subprocess.run([*command, "stop"], capture_output=True, timeout=12)
+        self.addCleanup(stop)
+        runtime = json.loads((self.directory / ".sservcli/run.json").read_text())
+        base = f"http://127.0.0.1:{web_port}"
+        def api(path, method="GET", data=None):
+            request = urllib.request.Request(base + "/api/" + path, data=data, method=method,
+                                             headers={"X-Sservcli-Key": runtime["key"]})
+            with urllib.request.urlopen(request, timeout=10) as response:
+                return json.loads(response.read())
+        wait_for(lambda: api("status")["status"] == "connected")
+        for index in range(3):
+            self.roundtrip(index)
+        with urllib.request.urlopen(base, timeout=3) as response:
+            page = response.read().decode()
+            self.assertIn("sservcli", page)
+            self.assertNotIn(self.secret, page)
+            self.assertNotIn(runtime["key"], page)
+            self.assertIn("frame-ancestors 'none'", response.headers["Content-Security-Policy"])
+        status = api("status")
+        self.assertEqual(len(status["services"]), 3)
+        self.assertNotIn(self.secret, json.dumps(status))
+        with self.assertRaises(urllib.error.HTTPError) as forbidden:
+            urllib.request.urlopen(base + "/api/status", timeout=3)
+        self.assertEqual(forbidden.exception.code, 403)
+        api("disconnect", "POST")
+        self.assertEqual(api("status")["status"], "disconnected")
+        # Reconnection reloads .token from disk; no token is sent over HTTP.
+        self.set_password("Z9y8X7w6")
+        (self.directory / ".token").write_text("Z9y8X7w6")
+        api("connect", "POST")
+        wait_for(lambda: api("status")["status"] == "connected")
+        self.roundtrip()
+        result = subprocess.run([*command, "start", "--web-port", str(web_port)], capture_output=True, text=True, timeout=5)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("already running", result.stdout)
+        changed = copy.deepcopy(self.profile)
+        changed["name"] = "Edited through local management"
+        api("config", "POST", json.dumps(changed).encode())
+        self.assertEqual(json.loads((self.directory / "services.json").read_text())["name"], changed["name"])
+        stop()
+        self.assertFalse((self.directory / ".sservcli/run.json").exists())
+        for service in self.profile["services"]:
+            with socket.socket() as listener:
+                listener.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+                listener.bind(("127.0.0.1", service["local_port"]))
 
 
 if __name__ == '__main__':

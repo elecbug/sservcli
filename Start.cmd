@@ -1,25 +1,21 @@
 @echo off
 setlocal DisableDelayedExpansion
 pushd "%~dp0" || exit /b 1
-if exist ".venv\Scripts\python.exe" goto environment
-where py >nul 2>nul
-if errorlevel 1 goto python
-py -3 -m sservcli.windows_launcher --start --config "%~dp0services.json"
-if not errorlevel 1 goto success
-:python
-where python >nul 2>nul
-if errorlevel 1 goto requirements
-python -m sservcli.windows_launcher --start --config "%~dp0services.json"
-if errorlevel 1 goto requirements
-goto success
-:environment
-".venv\Scripts\python.exe" -m sservcli.windows_launcher --start --config "%~dp0services.json"
-if errorlevel 1 goto requirements
-:success
+if not exist "sservcli.exe" goto build
+if not exist "sservcli-askpass.exe" goto build
+goto launch
+:build
+call Build.cmd
+if errorlevel 1 goto failed
+:launch
+"sservcli.exe" start
+if errorlevel 1 goto failed
+"sservcli.exe" ui
+echo Manage services at http://127.0.0.1:8000
 popd
 exit /b 0
-:requirements
-echo Run Build.cmd to check Python, Tcl/Tk, and Windows OpenSSH Client.
+:failed
+echo Check Windows OpenSSH Client, services.json, and .token beside sservcli.exe.
 pause
 popd
 exit /b 1

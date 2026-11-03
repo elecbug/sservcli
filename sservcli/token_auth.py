@@ -1,6 +1,5 @@
 """Eight-character tokens and local secret storage; SSH uses system OpenSSH."""
 import contextlib
-import hashlib
 import os
 from pathlib import Path
 import secrets
@@ -90,46 +89,3 @@ class FileLock:
         if self.file:
             self.file.close()
             self.file = None
-
-
-def token_slot(config):
-    ssh = config["ssh"]
-    identity = " ".join(ssh.get("host_public_key", "").split()[:2])
-    return hashlib.sha256(f"{identity}:{ssh.get('port', 22)}".encode()).hexdigest()
-
-
-def store_token(directory, config, token):
-    import json
-    directory = private_directory(directory)
-    path = directory / "tokens.json"
-    values = json.loads(read_private(path)) if path.exists() else {}
-    if not isinstance(values, dict):
-        raise ConfigError("Saved token store is invalid")
-    slot = token_slot(config)
-    if token is None:
-        values.pop(slot, None)
-    else:
-        token = validate_token(token)
-        if os.name == "nt":
-            from .windows import protect_secret
-            token = "dpapi:" + protect_secret(token)
-        values[slot] = token
-    write_private(path, json.dumps(values))
-
-
-def remembered_token(directory, config):
-    import json
-    path = Path(directory) / "tokens.json"
-    try:
-        values = json.loads(read_private(path))
-        if not isinstance(values, dict):
-            return None
-        value = values.get(token_slot(config))
-        if not isinstance(value, str):
-            return None
-        if os.name == "nt" and value and value.startswith("dpapi:"):
-            from .windows import unprotect_secret
-            value = unprotect_secret(value[6:])
-        return validate_token(value) if value else None
-    except (OSError, ValueError, TypeError):
-        return None

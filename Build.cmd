@@ -1,28 +1,26 @@
 @echo off
 setlocal DisableDelayedExpansion
 pushd "%~dp0" || exit /b 1
-if exist ".venv\Scripts\python.exe" goto environment
-where py >nul 2>nul
-if errorlevel 1 goto python
-py -3 -m sservcli.windows_launcher --setup
-if not errorlevel 1 goto success
-:python
-where python >nul 2>nul
+where go >nul 2>nul
 if errorlevel 1 goto requirements
-python -m sservcli.windows_launcher --setup
-if errorlevel 1 goto requirements
-goto success
-:environment
-".venv\Scripts\python.exe" -m sservcli.windows_launcher --setup
-if errorlevel 1 goto requirements
-:verify
-".venv\Scripts\python.exe" -m sservcli.windows_launcher --check
-if errorlevel 1 goto requirements
-:success
+set "CGO_ENABLED=0"
+set "GOWORK=off"
+pushd client || goto failed
+go build -trimpath -ldflags="-s -w" -o ..\sservcli.exe ./cmd/sservcli
+if errorlevel 1 goto buildfailed
+go build -trimpath -ldflags="-s -w -H=windowsgui" -o ..\sservcli-askpass.exe ./cmd/askpass
+if errorlevel 1 goto buildfailed
+popd
+echo Built sservcli.exe. Enable Windows OpenSSH Client and run Start.cmd.
 popd
 exit /b 0
+:buildfailed
+popd
+:failed
+popd
+exit /b 1
 :requirements
-echo Install Python 3.11 or newer with Tcl/Tk and the launcher from https://www.python.org/downloads/windows/
-echo Enable OpenSSH Client in Windows Optional Features. No pip packages or compilation are needed.
+echo Install Go from https://go.dev/dl/ to build the source ZIP.
+echo A ZIP that already contains sservcli.exe needs no Go or Python installation.
 popd
 exit /b 1

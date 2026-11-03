@@ -14,3 +14,14 @@
 .DS_Store
 var/*
 !.gitkeep
+
+# Local Go client credentials, runtime state, and build outputs
+.token
+.env
+.sservcli/
+/client/sservcli
+/client/sservcli.exe
+/sservcli.exe
+*.test
+
+/sservcli-askpass.exe

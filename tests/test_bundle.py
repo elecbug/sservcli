@@ -35,7 +35,7 @@ class BundleTests(unittest.TestCase):
         self.config_path = self.directory / "services.json"
         self.config_path.write_text(json.dumps(self.config))
         self.args = bundle.parser().parse_args([
-            "--legacy-ssh",
+            "--legacy-ssh", "--source-only",
             "--config", str(self.config_path),
             "--public-key", str(self.key_dir / "client.pub"),
             "--host-key", str(self.key_dir / "host.pub"),
@@ -70,13 +70,15 @@ class BundleTests(unittest.TestCase):
             self.assertIsNone(profile["ssh"]["identity_file"])
             self.assertNotIn("known_hosts_file", profile["ssh"])
             self.assertIn("host_public_key", profile["ssh"])
-            self.assertIn(b"--config", archive.read("Start.cmd"))
+            self.assertIn(b"sservcli.exe", archive.read("Start.cmd"))
             self.assertIn("Build.cmd", archive.namelist())
-            self.assertIn(b"sservcli.windows_launcher --check", archive.read("Build.cmd"))
+            self.assertIn(b"go build", archive.read("Build.cmd"))
             self.assertNotIn(b"cargo", archive.read("Build.cmd"))
-            for name in ["sservcli/__main__.py", "sservcli/config.py", "sservcli/tunnel.py", "sservcli/desktop.py", "sservcli/windows.py", "examples/services.token.windows.json"]:
+            for name in ["client/go.mod", "client/cmd/sservcli/main.go", "client/internal/app/tunnel.go", "client/internal/app/daemon.go", "examples/services.token.windows.json"]:
                 self.assertIn(name, archive.namelist())
-            self.assertNotIn("sservcli-desktop.exe", archive.namelist())
+            self.assertNotIn("sservcli.exe", archive.namelist())
+            self.assertFalse(any(name.endswith(".py") for name in archive.namelist()))
+            self.assertNotIn(".token", archive.namelist())
             self.assertIn("SHA256SUMS.txt", archive.namelist())
             for name in archive.namelist():
                 self.assertNotIn((self.key_dir / "client").read_bytes(), archive.read(name))
@@ -90,8 +92,8 @@ class BundleTests(unittest.TestCase):
             for line in sums:
                 expected, name = line.split("  ", 1)
                 self.assertEqual(hashlib.sha256(archive.read(name)).hexdigest(), expected)
-        result = subprocess.run([sys.executable, "-m", "sservcli", "check", "--config", "services.json"],
-                                cwd=extracted, capture_output=True, text=True)
+        result = subprocess.run(["go", "run", "./cmd/sservcli", "check", "--config", "../services.json"],
+                                cwd=extracted / "client", capture_output=True, text=True)
         self.assertEqual(result.returncode, 0, result.stderr)
 
     def test_late_zip_publish_failure_removes_only_the_new_managed_account(self):
@@ -165,7 +167,7 @@ class BundleTests(unittest.TestCase):
             path.write_bytes(b"do not distribute")
         files = bundle.source_files(root)
         self.assertFalse(any(b"do not distribute" in data for data in files.values()))
-        link = root / "sservcli/tunnel.py"
+        link = root / "client/internal/app/tunnel.go"
         link.unlink()
         link.symlink_to(self.key_dir / "client")
         with self.assertRaisesRegex(bundle.BundleError, "linked"):
@@ -219,26 +221,32 @@ class TokenBundleTests(unittest.TestCase):
         self.config["ssh"].update(host="192.0.2.10", fallback_hosts=["192.0.2.11"])
         self.path = self.directory / "services.json"
         self.path.write_text(json.dumps(self.config))
-        self.args = bundle.parser().parse_args(["--config", str(self.path), "--state-dir", str(self.directory / "state"),
+        self.args = bundle.parser().parse_args(["--source-only", "--config", str(self.path), "--state-dir", str(self.directory / "state"),
                                               "--output", str(self.directory / "client.zip")])
         self.commands = []
+        self.secret = "aB3dE5gH"
+        self.args.token_file = self.directory / "current.token"
+        self.args.token_file.write_text(self.secret)
+        self.args.token_file.chmod(0o600)
         def native_prepare(argv, **kwargs):
             argv = [str(value) for value in argv]
             self.commands.append(argv)
             self.assertIn("token-prepare", argv)
             self.assertNotIn("--public-key", argv)
-            return json.dumps({"user": "svc_tunnel_token1", "host_public_key": self.public})
+            return json.dumps({"user": "svc_tunnel_token1", "host_public_key": self.public, "token_active": True,
+                               "token_sha256": hashlib.sha256(self.secret.encode()).hexdigest()})
         self.mock = patch.object(bundle, "run", side_effect=native_prepare)
         self.mock.start()
         self.addCleanup(self.mock.stop)
 
-    def test_bundle_uses_system_sshd_identity_and_never_copies_a_token_or_private_key(self):
+    def test_bundle_includes_current_token_with_system_sshd_identity_and_no_private_keys(self):
         from sservcli.token_auth import private_directory, read_private, write_private
         private_directory(self.args.state_dir)
         secret = "aB3dE5gH"
         write_private(self.args.state_dir / "access.token", secret + "\n")
         self.args.public_key = self.directory / "missing-client.pub"
         first = bundle.package(self.args)
+        self.assertEqual(first.stat().st_mode & 0o777, 0o600)
         again = bundle.package(self.args)
         self.assertEqual(again.name, "client-2.zip")
         self.assertEqual(read_private(self.args.state_dir / "access.token").strip(), secret)
@@ -250,12 +258,15 @@ class TokenBundleTests(unittest.TestCase):
             self.assertEqual(profile["ssh"]["host_public_key"], self.public)
             self.assertEqual(profile["ssh"]["fallback_hosts"], ["192.0.2.11"])
             self.assertNotIn("identity_file", profile["ssh"])
-            self.assertIn("sservcli/askpass.py", archive.namelist())
+            self.assertEqual(archive.read(".token"), (secret + "\n").encode())
+            self.assertEqual((archive.getinfo(".token").external_attr >> 16) & 0o777, 0o600)
+            self.assertIn("client/internal/app/tunnel.go", archive.namelist())
             self.assertNotIn("sservcli/token_tunnel.py", archive.namelist())
-            self.assertNotIn(b"import paramiko", archive.read("sservcli/tunnel.py"))
-            self.assertNotIn(b'"pip"', archive.read("sservcli/windows_launcher.py"))
+            self.assertFalse(any(name.endswith(".py") for name in archive.namelist()))
+            self.assertIn(b"go build", archive.read("Build.cmd"))
             for name in archive.namelist():
-                self.assertNotIn(secret.encode(), archive.read(name))
+                if name != ".token":
+                    self.assertNotIn(secret.encode(), archive.read(name))
                 self.assertNotIn(self.host.read_bytes(), archive.read(name))
                 self.assertFalse(name.startswith(("var/", ".venv/")))
 
@@ -282,6 +293,30 @@ class TokenBundleTests(unittest.TestCase):
         self.assertEqual(self.commands, [])
         self.assertFalse(self.args.state_dir.exists())
         self.assertFalse(self.args.output.exists())
+
+    def test_stale_or_inactive_tokens_are_not_published(self):
+        for active, digest in ((False, hashlib.sha256(self.secret.encode()).hexdigest()), (True, "0" * 64)):
+            receipt = {"user": "svc_tunnel_token1", "host_public_key": self.public, "token_active": active, "token_sha256": digest}
+            with self.subTest(active=active), patch.object(bundle, "run", return_value=json.dumps(receipt)):
+                with self.assertRaisesRegex(bundle.BundleError, "matching active startup token"):
+                    bundle.package(self.args)
+            self.assertFalse(self.args.output.exists())
+
+    def test_binary_bundle_contains_both_go_executables(self):
+        self.args.source_only = False
+        with patch.object(bundle, "build_client", return_value={"sservcli.exe": b"MZclient", "sservcli-askpass.exe": b"MZaskpass"}):
+            output = bundle.package(self.args)
+        with zipfile.ZipFile(output) as archive:
+            self.assertEqual(archive.read("sservcli.exe"), b"MZclient")
+            self.assertEqual(archive.read("sservcli-askpass.exe"), b"MZaskpass")
+            self.assertEqual(archive.read(".token").strip(), self.secret.encode())
+
+    def test_missing_token_stops_before_server_account_changes(self):
+        self.args.token_file.unlink()
+        with self.assertRaisesRegex(bundle.BundleError, "Cannot read current token"):
+            bundle.package(self.args)
+        self.assertEqual(self.commands, [])
+
 
 
 if __name__ == "__main__":

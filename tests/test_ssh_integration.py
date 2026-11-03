@@ -53,7 +53,7 @@ class SshIntegrationTests(unittest.TestCase):
         self.sshd = shutil.which("sshd") or "/usr/sbin/sshd"
         if not Path(self.sshd).is_file():
             self.skipTest("OpenSSH server is required (install openssh-server)")
-        self.client_command = [sys.executable, "-m", "sservcli"]
+        self.client_command = [os.environ.get("SSERVCLI_CLIENT", str(ROOT / "client/sservcli"))]
         self.user = pwd.getpwuid(os.getuid()).pw_name
         for name in ("host", "identity", "wrong_host"):
             subprocess.run(["ssh-keygen", "-q", "-t", "ed25519", "-N", "", "-f", str(self.directory / name)], check=True)
@@ -262,23 +262,14 @@ class SshIntegrationTests(unittest.TestCase):
         self.assertIn("HOST IDENTIFICATION HAS CHANGED", self.cli_log_path.read_text())
         self.assertNotIn("[connected]", self.cli_log_path.read_text())
 
-    def test_init_generates_a_usable_profile_and_never_overwrites_one(self):
-        path = self.directory / "new-profile.json"
-        service = self.profile["services"][0]
-        command = [*self.client_command, "init", "--config", str(path), "--host", "127.0.0.1", "--port", str(self.port),
-                   "--user", self.user, "--host-key", str(self.directory / "host.pub"), "--identity", str(self.directory / "identity"),
-                   "--remote-port", str(service["remote_port"]), "--local-port", str(service["local_port"])]
-        result = subprocess.run(command, text=True, capture_output=True)
+    def test_go_client_validates_and_lists_the_same_profile(self):
+        path = self.directory / "profile.json"
+        path.write_text(json.dumps(self.profile))
+        result = subprocess.run([*self.client_command, "check", "--config", str(path)], capture_output=True, text=True)
         self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertIn("Pinned server host key: SHA256:", result.stdout)
-        self.profile = json.loads(path.read_text())
-        self.assertNotIn("known_hosts_file", self.profile["ssh"])
-        previous = path.read_bytes()
-        result = subprocess.run(command, text=True, capture_output=True)
-        self.assertNotEqual(result.returncode, 0)
-        self.assertEqual(path.read_bytes(), previous)
-        self.start_client()
-        self.connected()
+        result = subprocess.run([*self.client_command, "list", "--config", str(path), "--json"], capture_output=True, text=True)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(len(json.loads(result.stdout)), 3)
 
     def test_dropped_transport_reconnects(self):
         if not Path("/proc/self").exists():

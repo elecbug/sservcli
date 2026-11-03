@@ -1,2 +1,2 @@
-"""sservcli: one SSH connection, multiple local services. Python 3.11+."""
-__version__ = "2.0.0"
+"""Python server controller; the client is implemented entirely in Go."""
+__version__ = "3.0.0"

@@ -1,0 +1,28 @@
+package app
+
+// Served entirely by the Go binary: no Python, frontend toolchain, or CDN.
+const dashboard = `<!doctype html>
+<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>sservcli</title>
+<style nonce="{{NONCE}}">
+:root{color-scheme:dark;font:15px system-ui,sans-serif;background:#101820;color:#e5edf5}body{max-width:1080px;margin:40px auto;padding:0 20px}h1{font-size:28px;margin-bottom:6px}p{color:#a8bbcc}button{background:#263e50;color:inherit;border:1px solid #52738c;padding:9px 14px;border-radius:6px;cursor:pointer;margin:3px}button:hover{background:#35566d}button:disabled{opacity:.4;cursor:default}.status{padding:18px;background:#1b2b38;border-radius:10px;margin:22px 0;overflow-wrap:anywhere}#message{color:#acd8f6}table{width:100%;border-collapse:collapse}td,th{padding:12px 8px;text-align:left;border-bottom:1px solid #334858}td small{display:block;color:#a8bbcc}textarea,pre{width:100%;box-sizing:border-box;background:#0a1219;color:#d9e8f5;border:1px solid #334858;border-radius:7px;padding:14px;font:13px ui-monospace,monospace}textarea{height:360px}pre{max-height:260px;overflow:auto;white-space:pre-wrap;overflow-wrap:anywhere}details{margin:24px 0}a{color:#94d4ff}#notice{color:#ffcf8b;min-height:1.5em}code{color:#c9e6fc}@media(max-width:700px){body{margin-top:20px}td,th{padding:7px 3px;font-size:13px}}
+</style></head><body>
+<h1>sservcli</h1><p>Local services over one verified OpenSSH connection</p>
+<div class="status"><strong id="status">Loading</strong><p id="message"></p><small id="identity"></small></div>
+<div><button id="connect">Connect / reconnect</button><button id="disconnect">Disconnect</button><button id="quit">Stop background client</button></div><p id="notice" role="status"></p>
+<table><thead><tr><th>Service</th><th>Local address</th><th>Actions</th></tr></thead><tbody id="services"></tbody></table>
+<p>Put the current eight-character server token in <code>.token</code> beside the executable. Reconnect after changing it. The token is never displayed here.</p>
+<details><summary>Edit services.json</summary><p>Save the configuration, then reconnect to apply it. Server allowlist changes must also be provisioned on the server.</p><textarea id="config" spellcheck="false" aria-label="services.json"></textarea><button id="load">Reload file</button><button id="save">Save configuration</button></details>
+<details><summary>Connection log</summary><pre id="logs"></pre></details>
+<script nonce="{{NONCE}}">
+let key=location.hash.slice(1)||localStorage.getItem('sservcli-management-key')||'';
+if(location.hash){if(/^[a-f0-9]{64}$/.test(key))localStorage.setItem('sservcli-management-key',key);history.replaceState(null,'',location.pathname)}
+async function api(path,method='GET',body){const response=await fetch('/api/'+path,{method,headers:{'X-Sservcli-Key':key},body});const value=await response.json();if(!response.ok)throw Error(value.error||'Request failed');return value}
+function notice(value){document.getElementById('notice').textContent=value}
+async function action(path){try{const result=await api(path,'POST');notice(result.message);await refresh()}catch(error){notice(error.message)}}
+let stopped=false;
+async function refresh(){if(stopped)return;try{const s=await api('status');document.getElementById('status').textContent=(s.name||'sservcli')+' — '+s.status;document.getElementById('message').textContent=s.message;document.getElementById('identity').textContent=s.host_key_fingerprint||'';document.getElementById('logs').textContent=(s.logs||[]).join('\n');const list=document.getElementById('services');list.replaceChildren();for(const service of s.services){const row=document.createElement('tr');const name=document.createElement('td');name.textContent=service.name;const detail=document.createElement('small');detail.textContent=service.kind+' · '+(service.enabled?'enabled':'disabled')+' · server :'+service.remote_port;name.append(detail);const address=document.createElement('td');address.textContent=['web','api'].includes(service.kind)?service.url:service.endpoint;const actions=document.createElement('td');const copy=document.createElement('button');copy.textContent='Copy';copy.onclick=async()=>{try{await navigator.clipboard.writeText(address.textContent);notice('Copied')}catch{notice('Select and copy the local address above')}};const open=document.createElement('button');open.textContent='Open';open.disabled=s.status!=='connected'||!service.enabled;open.onclick=()=>action('open?id='+encodeURIComponent(service.id));actions.append(copy,open);row.append(name,address,actions);list.append(row)}}catch(error){notice('Run Start.cmd or sservcli ui to authorize this browser. '+error.message)}}
+document.getElementById('connect').onclick=()=>action('connect');document.getElementById('disconnect').onclick=()=>action('disconnect');document.getElementById('quit').onclick=async()=>{if(!confirm('Stop all forwards and exit the background client?'))return;try{await api('stop','POST');stopped=true;notice('Client stopped. You can close this tab.');document.getElementById('status').textContent='Stopped'}catch(error){notice(error.message)}};
+async function load(){try{document.getElementById('config').value=JSON.stringify(await api('config'),null,2)}catch(error){notice(error.message)}}
+document.getElementById('load').onclick=load;document.getElementById('save').onclick=async()=>{try{const text=document.getElementById('config').value;JSON.parse(text);const result=await api('config','POST',text);notice(result.message)}catch(error){notice(error.message)}};
+refresh();load();setInterval(refresh,2000);
+</script></body></html>`
