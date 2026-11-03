@@ -1,7 +1,8 @@
 import importlib.util
 import json
 from pathlib import Path
-import struct
+import hashlib
+import sys
 import subprocess
 import tempfile
 import unittest
@@ -12,16 +13,6 @@ ROOT = Path(__file__).resolve().parents[1]
 spec = importlib.util.spec_from_file_location("bundle", ROOT / "tools/bundle_windows.py")
 bundle = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(bundle)
-
-
-def executable():
-    value = bytearray(128)
-    value[:2] = b"MZ"
-    struct.pack_into("<I", value, 60, 64)
-    value[64:68] = b"PE\0\0"
-    struct.pack_into("<H", value, 68, 0x8664)
-    struct.pack_into("<H", value, 88, 0x20b)
-    return bytes(value)
 
 
 class BundleTests(unittest.TestCase):
@@ -41,18 +32,12 @@ class BundleTests(unittest.TestCase):
         self.config["ssh"].update({"host": "192.0.2.10", "fallback_hosts": ["192.0.2.11"], "port": 2222, "user": "bundle_test", "identity_file": None})
         self.config_path = self.directory / "services.json"
         self.config_path.write_text(json.dumps(self.config))
-        native = self.directory / "native"
-        native.mkdir()
-        for name in ("sservcli.exe", "sservcli-desktop.exe"):
-            (native / name).write_bytes(executable())
         self.args = bundle.parser().parse_args([
             "--config", str(self.config_path),
             "--public-key", str(self.key_dir / "client.pub"),
             "--host-key", str(self.key_dir / "host.pub"),
             "--output", str(self.directory / "client.zip"),
         ])
-        self.args.windows_artifact = None
-        self.native = native
         self.operations = []
         self.commands = []
         real_run = bundle.run
@@ -69,7 +54,7 @@ class BundleTests(unittest.TestCase):
         self.runner.start()
         self.addCleanup(self.runner.stop)
 
-    def test_source_bundle_has_build_inputs_json_settings_and_no_private_keys(self):
+    def test_bundle_runs_after_extraction_and_contains_settings_without_private_keys(self):
         output = bundle.package(self.args)
         self.assertEqual(self.operations, ["install"])
         with zipfile.ZipFile(output) as archive:
@@ -83,9 +68,9 @@ class BundleTests(unittest.TestCase):
             self.assertIn("host_public_key", profile["ssh"])
             self.assertIn(b"--config", archive.read("Start.cmd"))
             self.assertIn("Build.cmd", archive.namelist())
-            self.assertIn(b"cargo build --workspace --release --locked", archive.read("Build.cmd"))
-            self.assertIn(b"npm.cmd", archive.read("Build.cmd"))
-            for name in ["Cargo.toml", "Cargo.lock", "client/Cargo.toml", "client/src/lib.rs", "client/examples/services.windows.json", "client/desktop/package-lock.json", "client/desktop/ui/app.js", "client/desktop/src-tauri/Cargo.lock", "client/desktop/src-tauri/icons/icon.ico"]:
+            self.assertIn(b"sservcli.windows_launcher --check", archive.read("Build.cmd"))
+            self.assertNotIn(b"cargo", archive.read("Build.cmd"))
+            for name in ["sservcli/__main__.py", "sservcli/config.py", "sservcli/tunnel.py", "sservcli/desktop.py", "sservcli/windows.py", "client/examples/services.windows.json"]:
                 self.assertIn(name, archive.namelist())
             self.assertNotIn("sservcli-desktop.exe", archive.namelist())
             self.assertIn("SHA256SUMS.txt", archive.namelist())
@@ -94,25 +79,19 @@ class BundleTests(unittest.TestCase):
                 self.assertFalse(any(part in ("target", "node_modules", ".git", "gen", "key") for part in Path(name).parts))
         self.assertFalse(any(Path(command[0]).name in ("gh", "git", "cargo", "npm", "npm.cmd") for command in self.commands))
         bundle.validate_profile(profile)
-        validator = ROOT / "target/debug/sservcli"
-        if validator.is_file():
-            subprocess.run([str(validator), "check", "--config", str(self.write_profile(profile))], check=True, capture_output=True)
-
-    def write_profile(self, profile):
-        path = self.directory / "extracted-profile.json"
-        path.write_text(json.dumps(profile))
-        return path
-
-    def test_invalid_binary_stops_before_any_account_changes(self):
-        self.args.windows_artifact = self.native
-        (self.args.windows_artifact / "sservcli-desktop.exe").write_bytes(b"not an executable")
-        with self.assertRaises(bundle.BundleError):
-            bundle.package(self.args)
-        self.assertEqual(self.operations, [])
-        self.assertFalse(self.args.output.exists())
+        extracted = self.directory / "extracted"
+        with zipfile.ZipFile(output) as archive:
+            archive.extractall(extracted)
+            sums = archive.read("SHA256SUMS.txt").decode().splitlines()
+            for line in sums:
+                expected, name = line.split("  ", 1)
+                self.assertEqual(hashlib.sha256(archive.read(name)).hexdigest(), expected)
+        result = subprocess.run([sys.executable, "-m", "sservcli", "check", "--config", "services.json"],
+                                cwd=extracted, capture_output=True, text=True)
+        self.assertEqual(result.returncode, 0, result.stderr)
 
     def test_late_zip_publish_failure_removes_only_the_new_managed_account(self):
-        with patch.object(bundle.os, "replace", side_effect=OSError("fixture publish failure")):
+        with patch.object(bundle.os, "link", side_effect=OSError("fixture publish failure")):
             with self.assertRaisesRegex(OSError, "publish failure"):
                 bundle.package(self.args)
         self.assertEqual(self.operations, ["install", "remove"])
@@ -132,23 +111,10 @@ class BundleTests(unittest.TestCase):
 
     def test_dry_run_never_builds_dispatches_or_modifies_accounts(self):
         self.args.dry_run = True
-        self.args.windows_artifact = None
         bundle.package(self.args)
         self.assertEqual(self.operations, [])
         self.assertEqual(self.commands, [])
         self.assertFalse(self.args.output.exists())
-
-    def test_zip_path_traversal_and_duplicate_executables_are_rejected(self):
-        path = self.directory / "untrusted.zip"
-        with zipfile.ZipFile(path, "w") as archive:
-            archive.writestr("../sservcli.exe", executable())
-        with self.assertRaisesRegex(bundle.BundleError, "unsafe ZIP path"):
-            bundle.read_binaries(path)
-        with zipfile.ZipFile(path, "w") as archive:
-            archive.writestr("one/sservcli.exe", executable())
-            archive.writestr("two/sservcli.exe", executable())
-        with self.assertRaisesRegex(bundle.BundleError, "Duplicate"):
-            bundle.read_binaries(path)
 
     def test_source_allowlist_excludes_caches_keys_and_rejects_links(self):
         root = self.directory / "source"
@@ -156,13 +122,14 @@ class BundleTests(unittest.TestCase):
             path = root / name
             path.parent.mkdir(parents=True, exist_ok=True)
             path.write_bytes(data)
-        for name in ("key/secret.pem", ".git/config", "client/desktop/node_modules/cache.js", "client/desktop/src-tauri/target/generated.rs", "client/desktop/src-tauri/gen/capabilities.json"):
+        for name in ("key/secret.pem", ".git/config", "sservcli/__pycache__/cache.py", "sservcli/private.pem", "target/generated.rs"):
             path = root / name
             path.parent.mkdir(parents=True, exist_ok=True)
             path.write_bytes(b"do not distribute")
         files = bundle.source_files(root)
         self.assertFalse(any(b"do not distribute" in data for data in files.values()))
-        link = root / "client/src/linked.rs"
+        link = root / "sservcli/tunnel.py"
+        link.unlink()
         link.symlink_to(self.key_dir / "client")
         with self.assertRaisesRegex(bundle.BundleError, "linked"):
             bundle.source_files(root)
@@ -174,12 +141,15 @@ class BundleTests(unittest.TestCase):
         with zipfile.ZipFile(output) as archive:
             self.assertEqual(json.loads(archive.read("services.json"))["ssh"]["identity_file"], "~/.ssh/my_existing_key")
 
-    def test_prebuilt_binaries_can_still_be_used_locally(self):
-        self.args.windows_artifact = self.native
+    def test_client_only_packages_existing_profile_without_public_key_or_account_changes(self):
+        self.args.client_only = True
+        self.args.public_key = None
         output = bundle.package(self.args)
+        self.assertEqual(self.operations, [])
+        self.assertEqual(self.commands, [])
         with zipfile.ZipFile(output) as archive:
-            self.assertIn("sservcli-desktop.exe", archive.namelist())
-            self.assertNotIn("Build.cmd", archive.namelist())
+            self.assertEqual(json.loads(archive.read("services.json")), self.config)
+            self.assertIn("Start.cmd", archive.namelist())
 
     def test_validation_rejects_invalid_types_fields_and_service_settings(self):
         for mutation in range(7):

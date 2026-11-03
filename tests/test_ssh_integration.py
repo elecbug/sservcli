@@ -10,6 +10,7 @@ import signal
 import socket
 import socketserver
 import subprocess
+import sys
 import tempfile
 import threading
 import time
@@ -52,8 +53,7 @@ class SshIntegrationTests(unittest.TestCase):
         self.sshd = shutil.which("sshd") or "/usr/sbin/sshd"
         if not Path(self.sshd).is_file():
             self.skipTest("OpenSSH server is required (install openssh-server)")
-        self.binary = Path(os.environ.get("SSERVCLI_BIN", ROOT / "target/debug/sservcli"))
-        self.assertTrue(self.binary.is_file(), "Run cargo build first")
+        self.client_command = [sys.executable, "-m", "sservcli"]
         self.user = pwd.getpwuid(os.getuid()).pw_name
         for name in ("host", "identity", "wrong_host"):
             subprocess.run(["ssh-keygen", "-q", "-t", "ed25519", "-N", "", "-f", str(self.directory / name)], check=True)
@@ -108,7 +108,7 @@ class SshIntegrationTests(unittest.TestCase):
         self.cli_log_path = self.directory / "client.log"
         log = self.cli_log_path.open("w")
         self.addCleanup(log.close)
-        self.cli = subprocess.Popen([str(self.binary), "connect", "--config", str(path)], stderr=log, stdout=subprocess.DEVNULL, env=getattr(self, "cli_env", None))
+        self.cli = subprocess.Popen([*self.client_command, "connect", "--config", str(path)], stderr=log, stdout=subprocess.DEVNULL, env=getattr(self, "cli_env", None))
         self.addCleanup(self.stop_client)
 
     def stop_client(self):
@@ -232,7 +232,7 @@ class SshIntegrationTests(unittest.TestCase):
     def test_init_generates_a_usable_profile_and_never_overwrites_one(self):
         path = self.directory / "new-profile.json"
         service = self.profile["services"][0]
-        command = [str(self.binary), "init", "--config", str(path), "--host", "127.0.0.1", "--port", str(self.port),
+        command = [*self.client_command, "init", "--config", str(path), "--host", "127.0.0.1", "--port", str(self.port),
                    "--user", self.user, "--host-key", str(self.directory / "host.pub"), "--identity", str(self.directory / "identity"),
                    "--remote-port", str(service["remote_port"]), "--local-port", str(service["local_port"])]
         result = subprocess.run(command, text=True, capture_output=True)

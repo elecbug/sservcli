@@ -5,6 +5,7 @@
 *.pyc
 /services.json
 /dist/
+/sservcli-windows-*.zip
 /client/desktop/src-tauri/gen/
 *.pem
 *.key

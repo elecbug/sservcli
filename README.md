@@ -1,570 +1,224 @@
 # sservcli
 
-Access several services on one server through one authenticated SSH connection.
-sservcli provides a Rust connection manager and CLI, a Tauri 2 desktop interface,
-and an Ubuntu server provisioning tool. The server runs ordinary OpenSSH; there
-is no additional network daemon or publicly exposed management API.
+Use several services on one server through a single verified SSH connection. The client starts every enabled forward automatically and lists the local addresses in a desktop window. On Windows it runs in the notification area; closing the window keeps the forwards running.
 
-This is an OpenSSH-based MVP. Web services open in your browser, and database or
-TCP services open in a configured local client. The application connects to
-services that are **already running**; it does not start server processes or
-grant a remote shell.
-
-## Architecture
-
-The recommended setup uses an existing SSH account and its already-authorized
-private key or Agent. The server provisioning tool is optional. The desktop app
-forwards every enabled service automatically at launch and stays in the tray.
-
-### Quick connection with an existing account
-
-In **Connection settings**, enter your server address, SSH username, optional
-fallback addresses, and the trusted server host public key. Enter an existing
-private-key path, or leave it empty to use SSH Agent/default identities. Add your
-service ports and click **Save & connect all**. There is no need to create another
-server account or manually edit `known_hosts` when the existing account already
-allows TCP forwarding.
-
-The host public key identifies the server; your private key or Agent authenticates
-the account. Obtain the host `.pub` line and verify its fingerprint through a
-trusted administrator channel:
-
-```sh
-cat /etc/ssh/ssh_host_ed25519_key.pub
-ssh-keygen -lf /etc/ssh/ssh_host_ed25519_key.pub
-```
-
-Alternatively, create the profile from a trusted host-public-key file:
-
-```sh
-sservcli init --host 192.0.2.10 --fallback-hosts 192.0.2.11,192.0.2.12 \
-  --user ubuntu --host-key server-host-key.pub --identity "~/.ssh/id_ed25519"
-sservcli connect --config services.json
-```
-
-Omit `--identity` to use Agent/default identities. `init` refuses to overwrite
-an existing profile and does not modify the server. The initial service forwards
-local port `18080` to server port `8080`; override these with `--local-port` and
-`--remote-port`. `--port` selects the SSH port, and `--config` selects the output
-file. The desktop form can add multiple services without editing JSON.
-
-The saved profile is restored on the next desktop launch and all enabled services
-connect automatically in the background. **Local services…** in the tray opens
-the endpoint list. Closing the window keeps forwarding active; **Disconnect**
-stops the tunnel and **Quit** exits. Launching the desktop app a second time opens
-the existing instance. A terminal connection failure shows the window for diagnosis.
-The CLI's `connect` command remains attached to its terminal until Ctrl+C; the
-desktop executable provides the background/tray lifecycle.
-
-### Fallback IP array and inline host key
-
-Simple connections store this SSH section in the profile:
-
-```json
-"ssh": {
-  "host": "192.0.2.10",
-  "fallback_hosts": ["192.0.2.11", "192.0.2.12"],
-  "port": 22,
-  "user": "ubuntu",
-  "identity_file": null,
-  "host_public_key": "ssh-ed25519 REPLACE_WITH_THE_REAL_SERVER_PUBLIC_KEY"
-}
-```
-
-Use the actual complete host `.pub` line. The primary address is tried first,
-followed by the array in order. All addresses share one SSH port, username,
-identity, and pinned host key; use alternative routes to the same trusted server.
-Different host keys are rejected on every address. There may be at most 16 unique
-addresses including the primary. On startup the list is tried once; after an
-interrupted established connection, bounded recovery cycles start with the next
-address in the list. All services move together to the selected address.
-
-Choose exactly one verification source: `host_public_key` or `known_hosts_file`.
-The inline key is validated with `ssh-keygen`; a private temporary host-key file
-covers all candidate addresses and is removed on normal disconnect. Your personal
-SSH files are not modified. Advanced `known_hosts_file` profiles must contain
-trusted entries for each fallback address. `command` is available for those
-advanced profiles; use `connect` to manage the temporary file for inline-key profiles.
-
-The service list shows local addresses and forwarding state. **Forwarding** means
-SSH authenticated and its local listeners are ready, rather than an application
-health check. Database/TCP clients can connect to those local ports. An optional
-`launch` array enables the corresponding external-client launch button.
-
-### Transport
-
-```mermaid
-flowchart LR
-    UI[Desktop UI or CLI] --> Manager[Rust connection manager]
-    Manager --> SSH[One OpenSSH connection]
-    Browser[Local browser] --> Web[127.0.0.1:18080]
-    DB[Local database client] --> Postgres[127.0.0.1:15432]
-    API[Local API client] --> REST[127.0.0.1:19000]
-    Web --> SSH
-    Postgres --> SSH
-    REST --> SSH
-    SSH --> SSHD[Server sshd: public key + destination allowlist]
-    SSHD --> S1[127.0.0.1:8080]
-    SSHD --> S2[127.0.0.1:5432]
-    SSHD --> S3[127.0.0.1:9000]
-```
-
-| Service | Server destination | Local endpoint |
-| --- | --- | --- |
-| Web dashboard | `127.0.0.1:8080` | `http://127.0.0.1:18080/` |
-| PostgreSQL | `127.0.0.1:5432` | `127.0.0.1:15432` |
-| REST API | `127.0.0.1:9000` | `http://127.0.0.1:19000/docs` |
-
-All enabled forwards belong to a single SSH process. On Unix, a private OpenSSH
-control socket confirms successful authentication and listener setup. On Windows,
-the native TCP table must show that this SSH process owns every enabled loopback
-listener; an unrelated process listening on the same port cannot satisfy this
-check. Keepalives detect broken transports. Interrupted connections use bounded exponential backoff;
-initial failures try the ordered address list once and then stop.
+The entire application uses **Python 3.11+ and its standard library**. The desktop uses Tkinter; Windows integration uses `ctypes`. There are no pip dependencies. OpenSSH supplies the transport. The Ubuntu server uses its existing `sshd`; no application daemon runs on the server.
 
 ## Requirements
 
-- **CLI:** Windows 10/11, Linux, or macOS, an OpenSSH client, Rust 1.75+
-  and Cargo to build. The core has no GTK, Node.js, or Tauri dependency.
-- **Desktop:** Windows 10/11, Linux, or macOS, current stable Rust (at least 1.90 for the current single-instance plugin), Node.js 20.19+ or 22.12+,
-  and the [Tauri 2 platform prerequisites](https://v2.tauri.app/start/prerequisites/).
-  Linux requires the GTK/WebKit development libraries listed there. Current
-  Tauri dependencies may need a newer compiler than Tauri's original minimum.
-  Windows development requires Microsoft C++ Build Tools, an MSVC Rust toolchain,
-  and the WebView2 runtime described in those prerequisites.
-- **Optional server provisioning:** Ubuntu with Python 3.10+, OpenSSH server, systemd,
-  `useradd`, `userdel`, `pkill`, and root access. The default systemd unit is `ssh`.
-- **Service clients:** Your browser, `psql`, or any other configured executable.
-
-Windows uses native OpenSSH without Unix control sockets. The Windows optional
-OpenSSH Client feature is preferred over Git/WSL SSH wrappers; portable native
-`ssh.exe` on `PATH` is used if the Windows system copy is absent. Server
-provisioning remains an Ubuntu administrator task; Windows clients connect to
-the same server and use the same destination restrictions.
-
-## Optional setup with a restricted server account
-
-### One command: server setup and a build-ready Windows source ZIP
-
-Configure two values: `PUBKEY_FILE`, the existing Windows client's **Ed25519
-public key**, and `CONFIG`, the services JSON file. Start from the example:
-
-```sh
-cp client/examples/services.json services.json
-# Edit services.json: ssh.host, ssh.fallback_hosts, ssh.user, and service ports.
-make bundle PUBKEY_FILE=/path/to/client-id_ed25519.pub CONFIG=services.json
-```
-
-All connection settings come from `CONFIG`: server address, ordered fallback
-array, SSH port, new forwarding-only username, existing Windows identity path,
-and service definitions. Set `ssh.identity_file` to `null` for Agent/default
-identities, or to an existing Windows-side path such as `~/.ssh/id_ed25519`.
-Set `ssh.host` to a real address rather than the example hostname. The SSH port
-must already match the server's sshd configuration.
-
-The command validates the JSON and public key, gathers the local source/build
-inputs, enables/starts OpenSSH and creates missing host keys, creates the new
-account named by `ssh.user`, registers the client public key, and writes
-`dist/sservcli-windows-<ssh.user>-source.zip`. The generated client profile uses
-the server's actual public host key automatically, replacing the example's
-`known_hosts_file` setting. Privileged account setup uses `sudo`.
-
-Packaging requires Python 3.10+, Make, OpenSSH server/client, and sudo on Ubuntu.
-It requires no `gh`, Git checkout/commit/push, Rust/Cargo, Node.js, or Windows
-build on the server. Local uncommitted source edits are included. The ZIP uses
-an explicit build-input allowlist, excluding `.git`, build caches, generated
-files, and private key directories. Your existing client private key stays on
-Windows and is never copied into the archive.
-
-Preview without changing accounts, SSH services, or writing the final ZIP:
-
-```sh
-make bundle PUBKEY_FILE=/path/to/client.pub CONFIG=services.json DRY_RUN=1
-```
-
-The ZIP contains the Rust workspace, desktop HTML/CSS/JavaScript, dependency
-lockfiles, required icons/capabilities, the prepared `services.json`, server host
-public key, `Build.cmd`, `Start.cmd`, a short README, and SHA-256 checksums.
-After extracting it on Windows:
-
-1. Install current stable Rust with the MSVC toolchain, Node.js, Microsoft C++
-   Build Tools, WebView2, and native OpenSSH Client.
-2. Run **Build.cmd** in Windows Terminal. It installs the declared npm packages,
-   builds the CLI and desktop locally with the lockfiles, and places both `.exe`
-   files beside `services.json`. Cargo/npm need their normal dependency access.
-3. Run **Start.cmd** to load that profile and forward every enabled service in
-   the background. Your existing identity or SSH Agent must be usable on Windows.
-
-For an already-built local binary ZIP/directory, `WINDOWS_ARTIFACT` is optional;
-it must contain Windows x64 `sservcli.exe` and `sservcli-desktop.exe`. This mode
-also uses no remote build. `BUNDLE_OUTPUT` overrides the destination ZIP, and
-`HOST_KEY_FILE` selects a nondefault active server host public key. Existing
-accounts/homes and output ZIPs are refused; choose a new `ssh.user` or output
-path. A late packaging failure attempts to remove only the newly created account.
-
-Download using your existing administrator SSH account, because the new
-forwarding-only account intentionally has no SFTP/SCP sessions. For example,
-from Windows PowerShell (replace the server path and administrator username):
-
-```powershell
-scp.exe admin@203.0.113.10:/path/to/sservcli/dist/sservcli-windows-svc_tunnel-source.zip .
-Expand-Archive .\sservcli-windows-svc_tunnel-source.zip -DestinationPath .\sservcli-client
-.\sservcli-client\Build.cmd
-.\sservcli-client\Start.cmd
-```
-
-### Individual administration commands
-
-Use this administrator workflow when you want a new forwarding-only account.
-Existing SSH accounts that already permit the required forwarding can use the
-quick connection above instead.
-
-### 1. Create a client profile and SSH identity
-
-On the client:
-
-```sh
-cp client/examples/services.json services.json
-ssh-keygen -t ed25519 -f ~/.ssh/sservcli -C sservcli
-ssh-add ~/.ssh/sservcli
-```
-
-Edit `services.json`: set `ssh.host` to your real server and `ssh.identity_file`
-to `~/.ssh/sservcli`. Keep the private key on the client. An encrypted private key
-must be unlocked in your local SSH Agent before connecting; sservcli never asks
-for a passphrase. Set `identity_file` to `null` to use identities from SSH Agent
-without selecting a particular file. Agent authentication does not require agent
-forwarding, which remains disabled.
-
-### 2. Provision the server
-
-Transfer the public key (`sservcli.pub`), the profile, and this repository to the
-server using an existing administrator connection. Client filesystem paths in
-the profile are not used by the server tool. Review the destinations before
-installing:
-
-```sh
-python3 server/sservcli_server.py render --config services.json
-sudo python3 server/sservcli_server.py install \
-  --config services.json --public-key /path/to/sservcli.pub
-```
-
-The tool creates a new `svc_tunnel` account, installs a root-controlled public key,
-appends a managed SSH policy, checks `sshd -t` and effective `sshd -T` settings,
-and reloads the SSH service. Existing users, homes, or managed account records
-are never reused. Validation or reload failure restores the previous SSH config
-and attempts to remove the newly created account. Installation does not change
-your firewall or start any application service.
-
-The existing Makefile interface is also available:
-
-```sh
-sudo make create PUBKEY_FILE=/path/to/sservcli.pub \
-  PERMIT_OPEN="127.0.0.1:8080 127.0.0.1:5432 127.0.0.1:9000"
-```
-
-`make create` uses `TUNNEL_USER` and `PERMIT_OPEN`; it does not read `CONFIG`.
-Use the Python command above when the JSON profile is your source of truth.
-Only plain Ed25519 public keys are accepted by the provisioning tool.
-
-### 3. Install a verified server host key
-
-Obtain `/etc/ssh/ssh_host_ed25519_key.pub` and its fingerprint through your
-administrator's trusted channel. The administrator can display the fingerprint:
-
-```sh
-sudo ssh-keygen -lf /etc/ssh/ssh_host_ed25519_key.pub
-```
-
-After verifying the transferred public key and fingerprint, install it on the
-client. This example assumes the trusted copy is named `server-host-key.pub`:
-
-```sh
-ssh-keygen -lf server-host-key.pub
-mkdir -p ~/.ssh
-chmod 700 ~/.ssh
-touch ~/.ssh/known_hosts
-chmod 600 ~/.ssh/known_hosts
-awk -v host="server.example.com" '{ print host " " $1 " " $2 }' \
-  server-host-key.pub >> ~/.ssh/known_hosts
-```
-
-Replace the hostname with exactly `ssh.host`. For a nonstandard SSH port, use
-`[server.example.com]:2222` as the host field. Keep `known_hosts_file` pointed at
-this file. Unknown and changed host keys fail closed. The application never
-automatically trusts scanned keys or edits your host-key database.
-
-### 4. Run the client
-
-```sh
-cargo build --release
-./target/release/sservcli check --config services.json
-./target/release/sservcli list --config services.json
-./target/release/sservcli connect --config services.json
-```
-
-Keep the client running while using your services. Press Ctrl+C to close the
-connection and release all local ports. Open a service as soon as the tunnel is
-ready:
-
-```sh
-./target/release/sservcli connect --config services.json --open dashboard
-```
-
-`--open` runs once after the initial connection, not after every reconnect.
-Inspect the equivalent standalone SSH command without connecting:
-
-```sh
-./target/release/sservcli command --config services.json
-```
-
-### 5. Run the desktop interface
-
-After installing Tauri's platform prerequisites:
-
-```sh
-cd client/desktop
-npm ci
-npm run dev
-```
-
-Open **Connection settings > Advanced**, enter the profile's filesystem path, and click
-**Load profile**. The built-in editor can validate and save a profile, including
-its per-service `enabled` settings. Disconnect before editing. In **Services**,
-click **Connect server**, then **Open service** or **Launch client**. The
-**Connection log** shows the last 200 SSH messages in memory. The profile is
-remembered and reconnects at the next launch; close the window to keep it in the
-tray, or use **Quit** in the tray menu to stop all forwarding.
-
-`npm run build` produces the native executable in
-`client/desktop/src-tauri/target/release/`. Installer bundling is disabled; code
-signing and platform installers are outside this MVP. Remote service pages open
-in an external browser and do not receive access to the Tauri IPC bridge.
-
-The default PostgreSQL example launches `psql`, which works in a terminal. From
-the desktop, choose a GUI database client or an installed terminal emulator:
-
-```json
-"launch": ["x-terminal-emulator", "-e", "psql", "-h", "{host}", "-p", "{port}", "-U", "app", "app"]
-```
-
-### Windows setup (PowerShell)
-
-Enable the **OpenSSH Client** optional feature if `ssh.exe -V` is unavailable.
-Microsoft documents installation in its
-[OpenSSH for Windows guide](https://learn.microsoft.com/en-us/windows-server/administration/openssh/openssh_install_firstuse).
-In an administrator PowerShell session:
-
-```powershell
-Add-WindowsCapability -Online -Name OpenSSH.Client~~~~0.0.1.0
-Set-Service -Name ssh-agent -StartupType Automatic
-Start-Service ssh-agent
-```
-
-Back in your normal PowerShell session, create your client identity and profile:
-
-```powershell
-New-Item -ItemType Directory -Force "$env:USERPROFILE/.ssh" | Out-Null
-ssh-keygen.exe -t ed25519 -f "$env:USERPROFILE/.ssh/sservcli" -C sservcli
-ssh-add.exe "$env:USERPROFILE/.ssh/sservcli"
-Copy-Item client/examples/services.windows.json services.json
-```
-
-Set the real server hostname in `services.json`, then provision the Ubuntu server
-with your public key as described above. The
-[Windows example](client/examples/services.windows.json) launches PostgreSQL in
-Windows Terminal (`wt.exe`) and expects `psql.exe` on `PATH`. Install those tools
-or replace `launch` with your database client's executable and arguments. A GUI
-client can be specified using an absolute executable path, such as
-`C:/Program Files/YourClient/client.exe`.
-
-Obtain and verify the server host public key and fingerprint through the same
-trusted administrator channel described in step 3. After verifying the trusted
-copy named `server-host-key.pub`, add its key to your Windows host-key database:
-
-```powershell
-ssh-keygen.exe -lf .\server-host-key.pub
-$keyFields = (Get-Content .\server-host-key.pub -Raw).Trim() -split '\s+'
-$entry = 'server.example.com {0} {1}' -f $keyFields[0], $keyFields[1]
-Add-Content -Path "$env:USERPROFILE/.ssh/known_hosts" -Value $entry -Encoding ascii
-```
-
-Replace the hostname; for a nonstandard port, use `[server.example.com]:2222`.
-Then build and connect:
-
-```powershell
-cargo build --release --locked
-.\target\release\sservcli.exe check --config services.json
-.\target\release\sservcli.exe connect --config services.json --open dashboard
-```
-
-Ctrl+C or Ctrl+Break disconnects and releases the forwarded ports. The managed
-SSH process belongs to a Windows job that also terminates it if the application
-is closed abruptly. Background SSH processes run without extra console windows.
-
-For the desktop app, install the
-[Windows Tauri prerequisites](https://v2.tauri.app/start/prerequisites/#windows),
-then run:
-
-```powershell
-Set-Location client/desktop
-npm.cmd ci
-npm.cmd run dev
-# Build the standalone executable:
-npm.cmd run build
-```
-
-The executable is `client/desktop/src-tauri/target/release/sservcli-desktop.exe`.
-Its settings screen accepts a Windows profile path such as
-`C:/Users/YourName/services.json`. Browser services use the Windows default
-HTTP(S) association directly, including URLs with query strings and Unicode.
-The `command` subcommand prints PowerShell quoting on Windows.
-
-## Profile reference
-
-See [`client/examples/services.json`](client/examples/services.json) for the
-complete dashboard, PostgreSQL, and API example. Unknown fields are rejected by
-the client to catch misspelled settings.
-
-| Field | Meaning |
+| System | Requirements |
 | --- | --- |
-| `version` | Schema version; currently `1` |
-| `name` | Display name for this server |
-| `ssh.host`, `ssh.port`, `ssh.user` | Primary hostname/IP, port (default `22`), existing or dedicated account |
-| `ssh.fallback_hosts` | Ordered array of alternative addresses; default empty |
-| `ssh.identity_file` | Private key or public identity file; `null` for agent selection |
-| `ssh.host_public_key` | Trusted inline server host public key; manages verification automatically |
-| `ssh.known_hosts_file` | Advanced verified host-key database, as an alternative to `host_public_key` |
-| `reconnect.enabled` | Retry interrupted established connections; default `true` |
-| `reconnect.max_attempts` | Total retries per Connect action; default `5`, maximum `100` |
-| `reconnect.initial_delay_secs` | First retry delay; default `2` |
-| `reconnect.max_delay_secs` | Backoff cap; default `30`, maximum `300` |
-| `services[].id`, `name` | Unique service id and display name |
-| `services[].kind` | `web`, `api`, `database`, or `tcp` |
-| `services[].remote_host` | Must be the literal `127.0.0.1` |
-| `services[].remote_port` | Server port, `1–65535` |
-| `services[].local_port` | Unique unprivileged client port, `1024–65535` |
-| `services[].enabled` | Include in this connection; default `true` |
-| `services[].scheme`, `path` | Browser URL scheme (`http`/`https`) and path; defaults `http`, `/` |
-| `services[].launch` | Optional local executable/argument array; no shell expansion |
+| Ubuntu server | Python 3.11+, OpenSSH server/client, GNU Make; sudo for account provisioning |
+| Windows client | Windows 10/11, Python 3.11+ with Tcl/Tk and the Python launcher, Windows OpenSSH Client |
+| Linux/macOS desktop | Python 3.11+, working Tkinter, OpenSSH Client, a graphical session |
 
-SSH paths are relative to the profile's directory; `~/` expands to `HOME` on Unix
-and `USERPROFILE` on Windows (falling back to `HOME` if needed). Windows also
-accepts `~\`, drive-absolute paths, and UNC paths. Prefer forward slashes in JSON,
-for example `C:/Users/Your Name/.ssh/known_hosts`; JSON backslashes must be escaped.
-Windows drive-relative paths such as `C:keys/id_ed25519` are rejected.
-Other environment-variable and SSH `%` token expansions are not
-supported. SSH config files are deliberately ignored (`-F none`), so aliases,
-ProxyJump, extra forwards, and `ProxyCommand` are not inherited.
+Install Python on Windows from [python.org](https://www.python.org/downloads/windows/), with Tcl/Tk enabled. The embeddable distribution does not include Tkinter. Enable **OpenSSH Client** in Windows Optional Features. `python -m tkinter` verifies the GUI installation. See the [Tkinter documentation](https://docs.python.org/3/library/tkinter.html) and [Python on Windows](https://docs.python.org/3/using/windows.html).
 
-Launch arguments accept `{host}`, `{port}`, and `{url}`. Executables are resolved
-through your local `PATH` or an explicit path. Profiles with launch commands are
-trusted local code: review them before opening a service. Store database and API
-credentials in the service's own client or keychain, rather than in this file.
-Web/API services without a launch array use the native default browser on
-Windows, `xdg-open` on Linux, or `open` on macOS; database/TCP services require a
-launch array to use the launch button.
-
-When using a restricted server account, changing a client's destination does not
-authorize it on the server. The server
-renderer includes **all** listed services, even those disabled in the UI; the
-`enabled` flag is a client preference. To change authorization in this version,
-remove and reinstall the managed account with the revised profile. This
-disconnects its users. Use separate accounts/profiles for different access roles.
-
-## Server administration and security
-
-The generated policy enforces public-key authentication, `MaxSessions 0`, local
-TCP forwarding only, and an exact `PermitOpen` allowlist. It disables password
-and keyboard-interactive login, agent/X11/Unix-socket forwarding, PTYs, tunnels,
-user RC execution, and reverse listeners. The authorized key independently uses
-`restrict,port-forwarding,permitopen="..."` restrictions. OpenSSH documents that
-[`MaxSessions 0` permits forwarding while denying shell and subsystem sessions](https://man.openbsd.org/sshd_config.5#MaxSessions).
-
-Inspect the effective policy for your real client source address, especially if
-the server already has `Match`, `Include`, `AllowUsers`, or `DenyUsers` rules:
+On Ubuntu 24.04:
 
 ```sh
-sudo python3 server/sservcli_server.py audit --config services.json \
-  --client-address 203.0.113.10
+sudo apt-get update
+sudo apt-get install -y python3 openssh-server make
 ```
 
-The installer audits `127.0.0.1` unless you pass `--client-address`. This checks
-one connection context, not every possible address-specific Match rule.
-Override `--sshd-config` or `--ssh-service` as needed. Concurrent provisioning
-operations are serialized with a file lock. Root-owned metadata in
-`/var/lib/sservcli` identifies accounts created by this tool.
+For the Linux GUI, also install `python3-tk`. Server provisioning and ZIP generation do not import Tkinter.
 
-Remove a managed account, its home, and its policy:
+## Prepare the server and Windows ZIP
+
+Use your existing SSH private key or SSH Agent on Windows. If you need a new client key, generate it **on Windows**, for example in PowerShell:
+
+```powershell
+ssh-keygen -t ed25519 -f "$env:USERPROFILE/.ssh/sservcli"
+```
+
+Transfer only `sservcli.pub` to the server administrator. Keep the private `sservcli` file on Windows. `PUBKEY_FILE` is the **client login public key**, separate from the server host key.
+
+On the server, copy the example and edit it:
 
 ```sh
-sudo python3 server/sservcli_server.py remove --user svc_tunnel
-# Or: sudo make delete TUNNEL_USER=svc_tunnel
+cp client/examples/services.windows.json services.json
 ```
 
-Removal denies new authentication, reloads the policy, stops existing account
-processes, and deletes the managed account. Modified account identities or edited
-managed blocks are refused. If policy cleanup fails after deletion, a denying
-block and metadata remain for administrator recovery. Accounts created by the
-original Makefile's `# BEGIN forwarding-only` policy are not adopted or deleted
-by this tool; migrate them manually or use a new dedicated username.
+Set `ssh.host` to the reachable server IP/hostname, `ssh.user` to a **new** dedicated account, and `ssh.fallback_hosts` to an ordered array of alternative addresses. Adjust the service ports. Set `ssh.identity_file` to your existing private key's Windows path, such as `~/.ssh/sservcli`, or `null` for Agent/default identities. `CONFIG` describes the Windows client, so this path need not exist on the server.
 
-Bind server applications to loopback and expose only SSH through your firewall.
-SSH protects transport and restricts destinations; each application still needs
-its own authentication and authorization. Other processes running on the client
-can reach its loopback ports, so service credentials remain necessary.
-
-**Connected** means SSH authentication and listener setup succeeded. It does not
-mean that a destination accepts connections or that an application is healthy.
-OpenSSH's [`ExitOnForwardFailure` does not test ultimate destinations](https://man.openbsd.org/ssh_config.5#ExitOnForwardFailure).
-Applications may need to reconnect or reload after a transport interruption.
-
-## Development and verification
+Preview, then provision and package:
 
 ```sh
-make check        # Example validation, policy rendering, JavaScript syntax
-make test         # Rust unit tests + Python server transaction tests
-make integration  # Real temporary OpenSSH daemon and loopback services
+make bundle PUBKEY_FILE=/path/to/sservcli.pub CONFIG=services.json DRY_RUN=1
+make bundle PUBKEY_FILE=/path/to/sservcli.pub CONFIG=services.json
 ```
 
-Integration tests also cover supplied host keys, existing Agent authentication,
-ordered fallback addresses, and first-time profile creation. Packaging tests use
-real key/profile validation and ZIP contents while mocking privileged account
-changes. They check CONFIG-driven settings, complete build inputs, private-key
-exclusion, and the absence of build/network commands during source packaging.
-
-Integration tests require an installed OpenSSH server, a usable local user, and
-the platform's SSH privilege-separation runtime directory (on Ubuntu,
-`/run/sshd`, normally created by the OpenSSH service). They run without root,
-create temporary keys/configuration, and never change your actual SSH config or
-authorized keys. They exercise multiple forwards over one transport, verified
-host keys, destination restrictions, shell/reverse-forwarding denial, clean
-shutdown, reconnection, and retry exhaustion. Server transaction tests mock
-account and systemd operations while using real temporary configuration files.
-
-The CLI/core and native UI use separate Cargo workspaces so core tests can run
-without desktop development libraries. On Windows, run
-`cargo test --workspace --locked`, `cargo build --release --locked`, and
-`node --check client/desktop/ui/app.js` directly in PowerShell; the Makefile and
-Python server tests use Unix tools. Windows unit tests exercise the native TCP
-listener table, ownership checks, Windows paths, and child-process job cleanup.
-The Windows CI job runs those tests, builds both `.exe` files, and uploads them
-as the `sservcli-windows-x64` artifact. Full temporary-sshd integration tests run
-on Linux; CI does not run a live Windows-to-server SSH session or automate the GUI.
-
-The local Linux development environment supports CLI builds and real SSH tests.
-Native Windows execution and the desktop UI need their respective platform
-toolchains; adding a CI job does not imply it has already passed remotely.
+The command validates the settings and Python files, generates missing server host keys, enables/starts SSH, creates the restricted account, registers the client public key, and produces:
 
 ```text
-client/src/                  Shared Rust configuration, SSH supervisor, and CLI
-client/examples/             Example connection profile
-client/desktop/ui/           Local desktop interface (plain HTML/CSS/JavaScript)
-client/desktop/src-tauri/    Tauri 2 command bridge and native application
-server/sservcli_server.py   Server policy renderer, installer, auditor, remover
-tests/                       Provisioning transactions and local SSH integration
+dist/sservcli-windows-<ssh.user>-python.zip
 ```
 
-Future extensions include a `russh` transport with direct TCP/IP channels for
-built-in API/database modules, service-specific health checks, and multiple
-simultaneous server profiles. These features are not implemented in this MVP.
+The packaged profile pins the actual server public host key. The ZIP contains the Python client, `Start.cmd`, `Build.cmd`, examples, documentation, and `SHA256SUMS.txt`. Private keys are never copied. Packaging is local and requires no GitHub, `gh`, Rust, Node.js, or Windows build host. Sudo is needed only for provisioning. Existing accounts, homes, and output ZIPs are refused. A packaging failure after successful account creation attempts to remove only that newly created managed account.
+
+Download with your normal administrator account, extract the **entire ZIP** under your Windows user account, and double-click **Start.cmd**. The forwarding account cannot use SFTP/SCP. Every enabled service connects automatically. Click the tray icon to show the service list; use tray **Quit** to stop forwarding. `Build.cmd` checks prerequisites and does not compile anything.
+
+| Optional input | Purpose |
+| --- | --- |
+| `BUNDLE_OUTPUT` | A new output ZIP path |
+| `HOST_KEY_FILE` | Server host public key; default `/etc/ssh/ssh_host_ed25519_key.pub` |
+| `SSHD_CONFIG` / `SSH_SERVICE` | SSH config/service; defaults `/etc/ssh/sshd_config` / `ssh` |
+| `DRY_RUN=1` | Validate without changing accounts or publishing a ZIP |
+| `PYTHON` | Make's Python executable; default `python3` |
+
+`CONFIG` defaults to `services.json`. `PUBKEY_FILE` is required for `bundle` and must contain one plain Ed25519 public key.
+
+## Updating an existing installation
+
+Existing version 1 profiles work with the Python client. For an already provisioned account, use the final `services.json` from the previous ZIP, including its pinned `host_public_key`:
+
+```sh
+make client-zip CONFIG=/path/to/existing/services.json BUNDLE_OUTPUT=dist/sservcli-python-update.zip
+```
+
+This packages the client without server account changes or `PUBKEY_FILE`. Extract into a new folder and run `Start.cmd`. Keep your existing private key/Agent and stop the old client first to release its local ports.
+
+The Rust/Tauri client has been replaced. Previously downloaded ZIPs still contain the old `Build.cmd`; extract the **new Python ZIP** to use the new implementation. Updating the server checkout does not update files already downloaded to Windows. The new script never invokes Cargo, so the former `edition2024` error no longer applies. Python must be installed on Windows: this ZIP does not bundle a Python runtime or standalone executable.
+
+## Configuration
+
+All local listeners and remote destinations use loopback:
+
+```json
+{
+  "version": 1,
+  "name": "My server",
+  "ssh": {
+    "host": "203.0.113.10",
+    "fallback_hosts": ["198.51.100.20", "server.example.net"],
+    "port": 22,
+    "user": "svc_tunnel",
+    "identity_file": "~/.ssh/sservcli",
+    "host_public_key": "ssh-ed25519 REPLACE_WITH_THE_REAL_SERVER_HOST_PUBLIC_KEY"
+  },
+  "reconnect": {
+    "enabled": true,
+    "max_attempts": 5,
+    "initial_delay_secs": 2,
+    "max_delay_secs": 30
+  },
+  "services": [
+    {
+      "id": "dashboard",
+      "name": "Web dashboard",
+      "kind": "web",
+      "remote_host": "127.0.0.1",
+      "remote_port": 8080,
+      "local_port": 18080,
+      "enabled": true,
+      "path": "/"
+    },
+    {
+      "id": "postgres",
+      "name": "PostgreSQL",
+      "kind": "database",
+      "remote_host": "127.0.0.1",
+      "remote_port": 5432,
+      "local_port": 15432,
+      "enabled": true,
+      "launch": ["wt.exe", "new-tab", "--", "psql.exe", "-h", "{host}", "-p", "{port}", "-U", "app", "app"]
+    }
+  ]
+}
+```
+
+Replace documentation addresses and the host-key placeholder before connecting.
+
+- The primary address is tried first, then alternatives in order. At most 16 unique addresses are allowed. They must reach the **same host key**. Host verification/authentication failures stop the connection; fallbacks cannot bypass them.
+- After an established connection drops, recovery starts with the next address. Reconnection uses bounded exponential delays and at most `max_attempts` recovery cycles across the session. Initial connection failure exhausts the address list once and stops.
+- All enabled services share one SSH process. Set `enabled: false` to skip a service. At least one must be enabled to connect.
+- Configure 1–64 services with unique IDs and local ports. Local ports must be 1024–65535 and remote ports 1–65535. `remote_host` must be `127.0.0.1`.
+- `kind` is `web`, `api`, `database`, or `tcp`. Web/API services open in the default browser. `scheme` defaults to `http` and may be `https`; `path` defaults to `/`.
+- `launch` is an executable/argument array supporting `{host}`, `{port}`, and `{url}`. It runs without a shell. GUI users should launch command-line tools through a terminal, as in the PostgreSQL example. Alternatively, copy the endpoint into an external client.
+- Relative key/known-hosts paths resolve from the profile directory; `~` resolves to the client user's home. In JSON use `/` or doubled backslashes for Windows paths.
+- Set exactly one of `host_public_key` or `known_hosts_file`. Pinned keys apply to all addresses. An existing known-hosts file must already trust each address under the selected SSH port. Unknown keys are never accepted automatically.
+- `identity_file: null` uses Agent/default identities. An explicit key uses `IdentitiesOnly=yes`. For encrypted keys, load the key into SSH Agent beforehand; the background client never prompts for a passphrase.
+- Profiles are trusted local files because `launch` can run a program. Import only profiles you trust. SSH uses `-F none`, strict host verification, public-key authentication, and no shell interpolation.
+
+Services keep their own authentication and authorization. A ready listener confirms that SSH forwarding is available; it does not prove the remote application is healthy.
+
+## Desktop and CLI
+
+Run from the repository or extracted ZIP:
+
+```sh
+python -m sservcli desktop --config services.json
+python -m sservcli check --config services.json
+python -m sservcli list --config services.json
+python -m sservcli connect --config services.json
+python -m sservcli connect --config services.json --open dashboard
+```
+
+Use `python3` where appropriate, or `py -3` on Windows. Ctrl+C stops the foreground client and releases its ports.
+
+The GUI provides a service catalog, local endpoint copying, connection setup, a full JSON editor, and logs. Opening a profile connects all enabled services. The last profile is remembered and connects when the program launches. Windows supports start-in-tray, show/connect/disconnect/quit, and one desktop instance per user. Starting a second instance shows the existing window. Linux/macOS minimize the window instead of using a native tray. The app does not install a Windows login task or OS service.
+
+`Start.cmd` uses `pythonw.exe` without a console. Windows preferences/startup logs live under `%LOCALAPPDATA%\sservcli`; Linux/macOS preferences use `$XDG_CONFIG_HOME/sservcli` or `~/.config/sservcli`. SSH logs are visible in the app.
+
+For a quick initial profile using an administrator-supplied host public key:
+
+```sh
+python -m sservcli init --host your-server.example --user existing-account \
+  --host-key server-host-key.pub --identity ~/.ssh/sservcli \
+  --fallback-hosts 192.0.2.20,192.0.2.21 --config services.json
+```
+
+`init` creates one web service, refuses to overwrite a file, and does not provision the server. Omitting `--identity` selects Agent/default identities. `command` prints the OpenSSH command for known-hosts profiles; pinned profiles use `connect`, which owns their temporary verification file and cleanup.
+
+## Server administration
+
+Generate missing server host keys and read the **public** key:
+
+```sh
+sudo ssh-keygen -A
+cat /etc/ssh/ssh_host_ed25519_key.pub
+```
+
+Never distribute `/etc/ssh/ssh_host_ed25519_key`, which is private. Obtain/verify the public key through a trusted administrator channel; an unverified `ssh-keyscan` result does not establish trust. A server host key identifies the server and does not grant login access.
+
+Preview or manage only the SSH policy:
+
+```sh
+make render CONFIG=services.json
+sudo python3 server/sservcli_server.py install --config services.json \
+  --public-key /path/to/sservcli.pub --ensure-ssh
+sudo python3 server/sservcli_server.py audit --config services.json
+sudo python3 server/sservcli_server.py remove --user svc_tunnel
+```
+
+The helper validates SSH config before reload, audits effective restrictions, publishes credentials only after policy activation, and rolls back failed provisioning. Managed metadata lives in `/var/lib/sservcli`. Removal refuses unexpected edits and denies login before account cleanup.
+
+The account requires public-key authentication, `MaxSessions 0`, local TCP forwarding, and an exact loopback `PermitOpen` allowlist. It denies shell/exec/SFTP, remote forwarding, agent/X11/socket forwarding, tunnels, and password/keyboard-interactive authentication. Key options add destination restrictions. Enforcement belongs to `sshd`; see the [OpenSSH configuration manual](https://man.openbsd.org/sshd_config).
+
+The helper does not install or start your web/DB/API services. Keep them bound to loopback where appropriate, expose SSH through the firewall, and ensure other SSH `Match` rules are compatible. The helper audits the effective policy before accepting the account.
+
+Explicit Make administration shortcuts also remain:
+
+```sh
+sudo make create TUNNEL_USER=svc_tunnel PUBKEY_FILE=/path/to/sservcli.pub \
+  PERMIT_OPEN="127.0.0.1:8080 127.0.0.1:5432"
+sudo make audit TUNNEL_USER=svc_tunnel PERMIT_OPEN="127.0.0.1:8080 127.0.0.1:5432"
+sudo make delete TUNNEL_USER=svc_tunnel
+```
+
+`bundle` gets its account/destinations from `CONFIG`, not these shortcut variables.
+
+## Verification and troubleshooting
+
+```sh
+make check test
+make integration
+# Optional Linux GUI checks:
+SSERVCLI_GUI_TESTS=1 xvfb-run -a python3 -m unittest discover -s tests -p test_desktop.py -v
+```
+
+Unit tests cover configuration, argument handling, bundle contents/checksums, instance notification, TCP tables, and provisioning rollback. Integration tests use isolated temporary `sshd` and real services to verify multiple forwards, host verification, key/Agent authentication, failover, reconnection, access restrictions, and shutdown. They do not modify real server accounts. Native Windows tests exercise listener ownership, child cleanup, tray lifecycle, and Tk widgets in CI.
+
+For `Permission denied (publickey)`, check that the Windows key/Agent matches `PUBKEY_FILE`. For a host key mismatch, verify the new key with the administrator before updating the profile. For an occupied local port, stop the old client or choose another unused port. Diagnose remote service health separately from SSH listener readiness.
+
+For missing Tkinter, repair Python with Tcl/Tk enabled (Ubuntu: `sudo apt-get install python3-tk`). If `py -3` selects an old installation, launch with the full path to Python 3.11+ using `-m sservcli desktop --config services.json`. When tray initialization fails, the app keeps the window accessible. Startup tracebacks from `Start.cmd` are saved to `%LOCALAPPDATA%\sservcli\desktop.log`.
