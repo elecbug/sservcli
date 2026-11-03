@@ -193,6 +193,39 @@ class SshIntegrationTests(unittest.TestCase):
         self.assertIn("Permission denied", self.cli_log_path.read_text())
         self.assertNotIn("[connected]", self.cli_log_path.read_text())
 
+    def test_binding_a_second_public_key_keeps_both_clients_authorized(self):
+        auth = self.directory / "authorized_keys"
+        allowed = [f"127.0.0.1:{service['remote_port']}" for service in self.profile["services"]]
+        original = auth.read_text()
+        updated, status = server.merge_key(original, (self.directory / "wrong_host.pub").read_text(), allowed)
+        self.assertEqual(status, "added")
+        self.assertTrue(updated.startswith(original))
+        auth.write_text(updated)
+        self.profile["ssh"]["identity_file"] = str(self.directory / "wrong_host")
+        self.start_client()
+        self.connected()
+        self.stop_client()
+        self.profile["ssh"]["identity_file"] = str(self.directory / "identity")
+        self.start_client()
+        self.connected()
+        self.assertEqual(self.daemon_log_path.read_text().count("Accepted publickey"), 2)
+
+    def test_rebinding_the_same_key_extends_its_allowed_services_without_duplicates(self):
+        auth = self.directory / "authorized_keys"
+        services = self.profile["services"][:2]
+        public_key = (self.directory / "identity.pub").read_text()
+        original = server.restricted_key(public_key, [f"127.0.0.1:{services[0]['remote_port']}"])
+        updated, status = server.merge_key(original, public_key, [f"127.0.0.1:{services[1]['remote_port']}"])
+        self.assertEqual(status, "updated")
+        self.assertEqual(updated.count(public_key.split()[1]), 1)
+        auth.write_text(updated)
+        self.start_client()
+        self.connected()
+        for index, service in enumerate(services):
+            with socket.create_connection(("127.0.0.1", service["local_port"]), timeout=3) as connection:
+                connection.sendall(b"merged")
+                self.assertEqual(connection.recv(1024), f"service-{index}:merged".encode())
+
     def test_existing_agent_works_with_a_supplied_server_key(self):
         agent_socket = self.directory / "agent.sock"
         agent = subprocess.Popen(["ssh-agent", "-D", "-a", str(agent_socket)], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)

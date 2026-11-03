@@ -39,7 +39,7 @@ On the server, copy the example and edit it:
 cp client/examples/services.windows.json services.json
 ```
 
-Set `ssh.host` to the reachable server IP/hostname, `ssh.user` to a **new** dedicated account, and `ssh.fallback_hosts` to an ordered array of alternative addresses. Adjust the service ports. Set `ssh.identity_file` to your existing private key's Windows path, such as `~/.ssh/sservcli`, or `null` for Agent/default identities. `CONFIG` describes the Windows client, so this path need not exist on the server.
+Set `ssh.host` to the reachable server IP/hostname, `ssh.user` to the dedicated account to create or reuse, and `ssh.fallback_hosts` to an ordered array of alternative addresses. Adjust the service ports. Set `ssh.identity_file` to your existing private key's Windows path, such as `~/.ssh/sservcli`, or `null` for Agent/default identities. `CONFIG` describes the Windows client, so this path need not exist on the server.
 
 Preview, then provision and package:
 
@@ -48,19 +48,29 @@ make bundle PUBKEY_FILE=/path/to/sservcli.pub CONFIG=services.json DRY_RUN=1
 make bundle PUBKEY_FILE=/path/to/sservcli.pub CONFIG=services.json
 ```
 
-The command validates the settings and Python files, generates missing server host keys, enables/starts SSH, creates the restricted account, registers the client public key, and produces:
+The command validates the settings and Python files, generates missing server host keys, enables/starts SSH, creates or reuses the account, and produces:
 
 ```text
 dist/sservcli-windows-<ssh.user>-python.zip
 ```
 
-The packaged profile pins the actual server public host key. The ZIP contains the Python client, `Start.cmd`, `Build.cmd`, examples, documentation, and `SHA256SUMS.txt`. Private keys are never copied. Packaging is local and requires no GitHub, `gh`, Rust, Node.js, or Windows build host. Sudo is needed only for provisioning. Existing accounts, homes, and output ZIPs are refused. A packaging failure after successful account creation attempts to remove only that newly created managed account.
+The packaged profile pins the actual server public host key. The ZIP contains the Python client, `Start.cmd`, `Build.cmd`, examples, documentation, and `SHA256SUMS.txt`. Private keys are never copied. Packaging is local and requires no GitHub, `gh`, Rust, Node.js, or Windows build host. Sudo is needed only for provisioning.
+
+Repeating the same `make bundle` command is supported:
+
+- If the account is missing, the helper creates it and registers the public key.
+- If sservcli already manages the account, it verifies the existing identity/policy and reuses it. A new public key is appended while other keys are preserved. An already registered key is matched by key type and blob, regardless of its comment, and is not duplicated.
+- New service destinations extend the managed allowlist. Previously allowed destinations remain available to existing keys. The matching sservcli key entry gains the new destinations; other keys retain their own restrictions. Administrator-supplied key options are preserved. `audit --config` checks the recorded full policy, including retained destinations.
+- If the account exists without sservcli metadata, account creation and key/policy changes are skipped and packaging continues. The command prints that it reused an external account. That account's existing SSH setup must already authorize the selected key and allow the configured forwarding destinations; its permissions stay under the administrator's control.
+- If a ZIP already exists, the next archive is saved as `...-2.zip`, `...-3.zip`, and so on. Earlier downloads are preserved.
+
+A packaging failure after successful account creation attempts to remove only that newly created account. Reused or external accounts are never removed by bundle cleanup; completed key registrations on reused accounts remain if a later packaging step fails. Invalid keys, unsafe filesystem paths, altered managed metadata, and SSH configuration errors still report a real error. An orphaned home without a corresponding account is not adopted automatically.
 
 Download with your normal administrator account, extract the **entire ZIP** under your Windows user account, and double-click **Start.cmd**. The forwarding account cannot use SFTP/SCP. Every enabled service connects automatically. Click the tray icon to show the service list; use tray **Quit** to stop forwarding. `Build.cmd` checks prerequisites and does not compile anything.
 
 | Optional input | Purpose |
 | --- | --- |
-| `BUNDLE_OUTPUT` | A new output ZIP path |
+| `BUNDLE_OUTPUT` | Output ZIP path; a numeric suffix is added if it already exists |
 | `HOST_KEY_FILE` | Server host public key; default `/etc/ssh/ssh_host_ed25519_key.pub` |
 | `SSHD_CONFIG` / `SSH_SERVICE` | SSH config/service; defaults `/etc/ssh/sshd_config` / `ssh` |
 | `DRY_RUN=1` | Validate without changing accounts or publishing a ZIP |
@@ -191,7 +201,7 @@ sudo python3 server/sservcli_server.py audit --config services.json
 sudo python3 server/sservcli_server.py remove --user svc_tunnel
 ```
 
-The helper validates SSH config before reload, audits effective restrictions, publishes credentials only after policy activation, and rolls back failed provisioning. Managed metadata lives in `/var/lib/sservcli`. Removal refuses unexpected edits and denies login before account cleanup.
+The helper validates SSH config before reload, audits effective restrictions, publishes credentials only after policy activation, and rolls back failed provisioning. Managed metadata lives in `/var/lib/sservcli`. Removal refuses unexpected edits and denies login before account cleanup. `install` remains a create-only administrator command; `bundle` uses the idempotent `ensure` command instead.
 
 The account requires public-key authentication, `MaxSessions 0`, local TCP forwarding, and an exact loopback `PermitOpen` allowlist. It denies shell/exec/SFTP, remote forwarding, agent/X11/socket forwarding, tunnels, and password/keyboard-interactive authentication. Key options add destination restrictions. Enforcement belongs to `sshd`; see the [OpenSSH configuration manual](https://man.openbsd.org/sshd_config).
 

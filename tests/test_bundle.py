@@ -40,6 +40,7 @@ class BundleTests(unittest.TestCase):
         ])
         self.operations = []
         self.commands = []
+        self.receipt = {"user": "bundle_test", "created": True, "account": "created", "key": "added"}
         real_run = bundle.run
         def isolated_run(argv, **kwargs):
             command = [str(arg) for arg in argv]
@@ -48,7 +49,7 @@ class BundleTests(unittest.TestCase):
             if server_path in command:
                 operation = command[command.index(server_path) + 1]
                 self.operations.append(operation)
-                return "simulated account operation\n"
+                return json.dumps(self.receipt) if operation == "ensure" else "simulated account removal\n"
             return real_run(argv, **kwargs)
         self.runner = patch.object(bundle, "run", side_effect=isolated_run)
         self.runner.start()
@@ -56,7 +57,7 @@ class BundleTests(unittest.TestCase):
 
     def test_bundle_runs_after_extraction_and_contains_settings_without_private_keys(self):
         output = bundle.package(self.args)
-        self.assertEqual(self.operations, ["install"])
+        self.assertEqual(self.operations, ["ensure"])
         with zipfile.ZipFile(output) as archive:
             profile = json.loads(archive.read("services.json"))
             self.assertEqual(profile["ssh"]["user"], "bundle_test")
@@ -94,20 +95,53 @@ class BundleTests(unittest.TestCase):
         with patch.object(bundle.os, "link", side_effect=OSError("fixture publish failure")):
             with self.assertRaisesRegex(OSError, "publish failure"):
                 bundle.package(self.args)
-        self.assertEqual(self.operations, ["install", "remove"])
+        self.assertEqual(self.operations, ["ensure", "remove"])
         self.assertFalse(self.args.output.exists())
 
-    def test_existing_output_and_invalid_profiles_are_rejected_before_provisioning(self):
+    def test_existing_output_is_preserved_and_new_archives_receive_a_suffix(self):
         self.args.output.write_text("existing download")
-        with self.assertRaisesRegex(bundle.BundleError, "already exists"):
-            bundle.package(self.args)
+        output = bundle.package(self.args)
         self.assertEqual(self.args.output.read_text(), "existing download")
-        self.args.output.unlink()
+        self.assertEqual(output.name, "client-2.zip")
+        with zipfile.ZipFile(output) as archive:
+            self.assertIn("services.json", archive.namelist())
+        self.receipt = {"user": "bundle_test", "created": False, "account": "reused", "key": "unchanged"}
+        self.assertEqual(bundle.package(self.args).name, "client-3.zip")
+
+    def test_invalid_profiles_are_rejected_before_provisioning(self):
         self.config["ssh"]["fallback_hosts"] = ["192.0.2.10"]
         self.config_path.write_text(json.dumps(self.config))
         with self.assertRaises(bundle.BundleError):
             bundle.package(self.args)
         self.assertEqual(self.operations, [])
+
+    def test_existing_managed_account_reuses_it_and_passes_key_binding_to_helper(self):
+        self.receipt = {"user": "bundle_test", "created": False, "account": "reused", "key": "added"}
+        output = bundle.package(self.args)
+        self.assertTrue(output.is_file())
+        self.assertEqual(self.operations, ["ensure"])
+        self.assertIn("--public-key", self.commands[0])
+        self.assertIn(str(self.key_dir / "client.pub"), self.commands[0])
+
+    def test_existing_external_account_still_produces_the_client_zip(self):
+        self.receipt = {"user": "bundle_test", "created": False, "account": "external", "key": "unchanged"}
+        self.assertTrue(bundle.package(self.args).is_file())
+        self.assertEqual(self.operations, ["ensure"])
+
+    def test_late_bundle_failure_never_removes_a_reused_or_external_account(self):
+        for kind in ("reused", "external"):
+            self.operations.clear()
+            self.receipt = {"user": "bundle_test", "created": False, "account": kind, "key": "unchanged"}
+            with self.subTest(kind=kind), patch.object(bundle.os, "link", side_effect=OSError("fixture publication failure")):
+                with self.assertRaisesRegex(OSError, "publication failure"):
+                    bundle.package(self.args)
+            self.assertEqual(self.operations, ["ensure"])
+
+    def test_inconsistent_account_receipt_never_triggers_automatic_deletion(self):
+        self.receipt = {"user": "bundle_test", "created": True, "account": "reused", "key": "added"}
+        with self.assertRaisesRegex(bundle.BundleError, "Invalid account setup receipt"):
+            bundle.package(self.args)
+        self.assertEqual(self.operations, ["ensure"])
 
     def test_dry_run_never_builds_dispatches_or_modifies_accounts(self):
         self.args.dry_run = True

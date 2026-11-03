@@ -24,7 +24,7 @@ help:
 	  'make desktop [CONFIG=services.json]   Run the Tkinter client' \
 	  'make build                           Check sources; no compilation is needed' \
 	  'make bundle PUBKEY_FILE=<client.pub> CONFIG=<services.json> [DRY_RUN=1]' \
-	  '                                     Create account, register key, package Windows client' \
+	  '                                     Create/reuse account, register key, package Windows client' \
 	  'make client-zip CONFIG=<services.json> Package client only; preserve existing server accounts' \
 	  'make render CONFIG=services.json      Preview server SSH policy' \
 	  'sudo make create PUBKEY_FILE=<client.pub> [TUNNEL_USER=svc_tunnel]' \

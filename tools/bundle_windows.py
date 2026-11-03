@@ -60,9 +60,17 @@ def write_archive(output, files, directory):
     with zipfile.ZipFile(archive, "w", compression=zipfile.ZIP_DEFLATED) as stream:
         for name, data in files.items():
             stream.writestr(name, data)
-    # Hard-link publication is exclusive: never replace another concurrent bundle.
-    os.link(archive, output)
+    # Keep previous downloads and handle competing publishers without clobbering.
+    index = 1
+    while True:
+        candidate = output if index == 1 else output.with_name(f"{output.stem}-{index}{output.suffix}")
+        try:
+            os.link(archive, candidate)
+            break
+        except FileExistsError:
+            index += 1
     archive.unlink()
+    return candidate
 
 
 def client_archive(config, inputs):
@@ -85,7 +93,7 @@ def client_archive(config, inputs):
 def server_command(args, operation, profile=None):
     command = [sys.executable, ROOT / "server/sservcli_server.py", operation,
                "--sshd-config", args.sshd_config, "--ssh-service", args.ssh_service]
-    if operation == "install":
+    if operation == "ensure":
         command += ["--config", profile, "--public-key", args.public_key, "--ensure-ssh"]
     else:
         command += ["--user", args.user]
@@ -101,7 +109,7 @@ def profile_for(args):
     if not args.host or args.host == "server.example.com":
         raise BundleError("Set ssh.host in CONFIG to the server's real reachable IP or hostname")
     if not isinstance(args.user, str):
-        raise BundleError("Set ssh.user in CONFIG to a new forwarding-only account name")
+        raise BundleError("Set ssh.user in CONFIG to the forwarding account name")
     server.username(args.user)
     ssh["known_hosts_file"] = "unused-during-validation"
     config["ssh"].pop("host_public_key", None)
@@ -120,23 +128,17 @@ def package(args):
     if args.client_only:
         config = load_profile(args.config)
         output = (args.output or ROOT / "dist/sservcli-windows-python.zip").absolute()
-        if output.exists():
-            raise BundleError(f"Output already exists; choose a new BUNDLE_OUTPUT: {output}")
         inputs = source_files()
         if args.dry_run:
             print("Dry run: client profile and Python runtime files validated; would publish:", output)
             return None
         output.parent.mkdir(parents=True, exist_ok=True)
         with tempfile.TemporaryDirectory(prefix=".sservcli-client-", dir=output.parent) as directory:
-            write_archive(output, client_archive(config, inputs), directory)
+            output = write_archive(output, client_archive(config, inputs), directory)
         print("Python client ZIP ready:", output)
         return output
     config = profile_for(args)
-    if server.account(args.user) or os.path.lexists(f"/home/{args.user}"):
-        raise BundleError("Account or home already exists; choose a new ssh.user in CONFIG or administer the existing managed account explicitly")
     output = (args.output or ROOT / f"dist/sservcli-windows-{args.user}-python.zip").absolute()
-    if output.exists():
-        raise BundleError(f"Output already exists; choose a new BUNDLE_OUTPUT: {output}")
     output.parent.mkdir(parents=True, exist_ok=True)
     created = False
     with tempfile.TemporaryDirectory(prefix=".sservcli-bundle-", dir=output.parent) as scratch:
@@ -146,13 +148,22 @@ def package(args):
         policy_profile = directory / "server-policy.json"
         policy_profile.write_text(json.dumps(config), encoding="utf-8")
         if args.dry_run:
-            print("Dry run: configuration, public key, and archive inputs validated; would generate missing host keys, start SSH, create account, register the client public key, and publish:", output)
+            print("Dry run: configuration, public key, and archive inputs validated; would generate missing host keys, start SSH, create/reuse the account, register a missing key for managed accounts, and publish (adding a suffix if the ZIP exists):", output)
             print("Account:", args.user, "Addresses:", [config["ssh"]["host"], *config["ssh"].get("fallback_hosts", [])])
             return None
         try:
-            print(f"Provisioning forwarding account {args.user} with the supplied client public key", flush=True)
-            print(run(server_command(args, "install", policy_profile)), end="")
-            created = True
+            print(f"Preparing forwarding account {args.user} with the supplied client public key", flush=True)
+            receipt = json.loads(run(server_command(args, "ensure", policy_profile)))
+            if (not isinstance(receipt, dict) or receipt.get("user") != args.user
+                    or type(receipt.get("created")) is not bool
+                    or receipt.get("account") not in ("created", "reused", "external")
+                    or receipt["created"] != (receipt["account"] == "created")
+                    or receipt.get("key") not in ("added", "updated", "unchanged")):
+                raise BundleError("Invalid account setup receipt; refusing automatic account cleanup")
+            created = receipt["created"]
+            print(f"Account: {receipt['account']}; public key: {receipt['key']}")
+            if receipt.get("message"):
+                print(receipt["message"])
             host_key = args.host_key.read_text(encoding="utf-8").strip()
             run(["ssh-keygen", "-lf", args.host_key])
             # Only public host-key material enters the ZIP.
@@ -161,7 +172,7 @@ def package(args):
             config["ssh"].pop("known_hosts_file", None)
             config["ssh"]["host_public_key"] = " ".join(host_key.split()[:2])
             validate_profile(config)
-            write_archive(output, client_archive(config, inputs), directory)
+            output = write_archive(output, client_archive(config, inputs), directory)
         except BaseException:
             if created:
                 print("Bundle failed after account creation; attempting to remove the newly created managed account", file=sys.stderr)
