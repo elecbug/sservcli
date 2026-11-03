@@ -13,7 +13,7 @@ PYTHON ?= python3
 
 # Values are environment data, never interpolated into shell source.
 export TUNNEL_USER PUBKEY_FILE PERMIT_OPEN SSHD_CONFIG SSH_SERVICE CONFIG
-export SERVER_HOST SERVER_PORT FALLBACK_HOSTS CLIENT_IDENTITY HOST_KEY_FILE WINDOWS_ARTIFACT WINDOWS_REPO WINDOWS_REF BUNDLE_OUTPUT DRY_RUN
+export HOST_KEY_FILE WINDOWS_ARTIFACT BUNDLE_OUTPUT DRY_RUN
 
 .PHONY: help create delete audit render build check test integration desktop bundle bundle-windows
 
@@ -24,7 +24,7 @@ help:
 	  'make test                            Rust and server tests (no root needed)' \
 	  'make integration                     Test with a temporary local sshd (no root)' \
 	  'make desktop                         Run Tauri (install its prerequisites first)' \
-	  'make bundle SERVER_HOST=<IP> PUBKEY_FILE=<client.pub> [WINDOWS_ARTIFACT=<zip-or-directory>] [DRY_RUN=1]' \
+	  'make bundle PUBKEY_FILE=<client.pub> CONFIG=<services.json> [DRY_RUN=1]  Prepare a Windows source ZIP' \
 	  'make render CONFIG=services.json      Preview the server SSH policy' \
 	  'sudo make create PUBKEY_FILE=/path/to/id_ed25519.pub [PERMIT_OPEN="127.0.0.1:8080 ..."]' \
 	  'sudo make audit [PERMIT_OPEN="127.0.0.1:8080 ..."]' \
@@ -63,5 +63,5 @@ integration:
 desktop:
 	cd client/desktop && npm run dev
 
-bundle bundle-windows: build
+bundle bundle-windows:
 	$(PYTHON) tools/bundle_windows.py

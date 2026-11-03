@@ -37,25 +37,28 @@ class BundleTests(unittest.TestCase):
         self.temp = tempfile.TemporaryDirectory()
         self.addCleanup(self.temp.cleanup)
         self.directory = Path(self.temp.name)
+        self.config = json.loads((ROOT / "client/examples/services.json").read_text())
+        self.config["ssh"].update({"host": "192.0.2.10", "fallback_hosts": ["192.0.2.11"], "port": 2222, "user": "bundle_test", "identity_file": None})
+        self.config_path = self.directory / "services.json"
+        self.config_path.write_text(json.dumps(self.config))
         native = self.directory / "native"
         native.mkdir()
         for name in ("sservcli.exe", "sservcli-desktop.exe"):
             (native / name).write_bytes(executable())
-        validator = ROOT / "target/debug/sservcli"
-        if not validator.is_file():
-            self.skipTest("Run cargo build or make test to build the real profile validator")
         self.args = bundle.parser().parse_args([
-            "--config", str(ROOT / "client/examples/services.json"),
-            "--host", "192.0.2.10", "--fallback-hosts", '["192.0.2.11"]',
-            "--user", "bundle_test", "--public-key", str(self.key_dir / "client.pub"),
+            "--config", str(self.config_path),
+            "--public-key", str(self.key_dir / "client.pub"),
             "--host-key", str(self.key_dir / "host.pub"),
-            "--windows-artifact", str(native), "--validator", str(validator),
             "--output", str(self.directory / "client.zip"),
         ])
+        self.args.windows_artifact = None
+        self.native = native
         self.operations = []
+        self.commands = []
         real_run = bundle.run
         def isolated_run(argv, **kwargs):
             command = [str(arg) for arg in argv]
+            self.commands.append(command)
             server_path = str(ROOT / "server/sservcli_server.py")
             if server_path in command:
                 operation = command[command.index(server_path) + 1]
@@ -66,21 +69,34 @@ class BundleTests(unittest.TestCase):
         self.runner.start()
         self.addCleanup(self.runner.stop)
 
-    def test_bundle_has_executables_pinned_profile_and_no_private_keys(self):
+    def test_source_bundle_has_build_inputs_json_settings_and_no_private_keys(self):
         output = bundle.package(self.args)
         self.assertEqual(self.operations, ["install"])
         with zipfile.ZipFile(output) as archive:
             profile = json.loads(archive.read("services.json"))
             self.assertEqual(profile["ssh"]["user"], "bundle_test")
             self.assertEqual(profile["ssh"]["fallback_hosts"], ["192.0.2.11"])
+            self.assertEqual(profile["ssh"]["host"], "192.0.2.10")
+            self.assertEqual(profile["ssh"]["port"], 2222)
             self.assertIsNone(profile["ssh"]["identity_file"])
             self.assertNotIn("known_hosts_file", profile["ssh"])
             self.assertIn("host_public_key", profile["ssh"])
             self.assertIn(b"--config", archive.read("Start.cmd"))
+            self.assertIn("Build.cmd", archive.namelist())
+            self.assertIn(b"cargo build --workspace --release --locked", archive.read("Build.cmd"))
+            self.assertIn(b"npm.cmd", archive.read("Build.cmd"))
+            for name in ["Cargo.toml", "Cargo.lock", "client/Cargo.toml", "client/src/lib.rs", "client/examples/services.windows.json", "client/desktop/package-lock.json", "client/desktop/ui/app.js", "client/desktop/src-tauri/Cargo.lock", "client/desktop/src-tauri/icons/icon.ico"]:
+                self.assertIn(name, archive.namelist())
+            self.assertNotIn("sservcli-desktop.exe", archive.namelist())
             self.assertIn("SHA256SUMS.txt", archive.namelist())
             for name in archive.namelist():
-                self.assertNotIn(b"PRIVATE KEY", archive.read(name))
-        bundle.run([self.args.validator, "check", "--config", self.write_profile(profile)])
+                self.assertNotIn((self.key_dir / "client").read_bytes(), archive.read(name))
+                self.assertFalse(any(part in ("target", "node_modules", ".git", "gen", "key") for part in Path(name).parts))
+        self.assertFalse(any(Path(command[0]).name in ("gh", "git", "cargo", "npm", "npm.cmd") for command in self.commands))
+        bundle.validate_profile(profile)
+        validator = ROOT / "target/debug/sservcli"
+        if validator.is_file():
+            subprocess.run([str(validator), "check", "--config", str(self.write_profile(profile))], check=True, capture_output=True)
 
     def write_profile(self, profile):
         path = self.directory / "extracted-profile.json"
@@ -88,6 +104,7 @@ class BundleTests(unittest.TestCase):
         return path
 
     def test_invalid_binary_stops_before_any_account_changes(self):
+        self.args.windows_artifact = self.native
         (self.args.windows_artifact / "sservcli-desktop.exe").write_bytes(b"not an executable")
         with self.assertRaises(bundle.BundleError):
             bundle.package(self.args)
@@ -107,18 +124,18 @@ class BundleTests(unittest.TestCase):
             bundle.package(self.args)
         self.assertEqual(self.args.output.read_text(), "existing download")
         self.args.output.unlink()
-        self.args.fallback_hosts = '["192.0.2.10"]'
+        self.config["ssh"]["fallback_hosts"] = ["192.0.2.10"]
+        self.config_path.write_text(json.dumps(self.config))
         with self.assertRaises(bundle.BundleError):
             bundle.package(self.args)
         self.assertEqual(self.operations, [])
 
-    def test_dry_run_does_not_dispatch_ci_or_modify_accounts(self):
+    def test_dry_run_never_builds_dispatches_or_modifies_accounts(self):
         self.args.dry_run = True
         self.args.windows_artifact = None
-        with patch.object(bundle, "fetch_binaries") as fetch:
-            bundle.package(self.args)
-            fetch.assert_not_called()
+        bundle.package(self.args)
         self.assertEqual(self.operations, [])
+        self.assertEqual(self.commands, [])
         self.assertFalse(self.args.output.exists())
 
     def test_zip_path_traversal_and_duplicate_executables_are_rejected(self):
@@ -133,27 +150,49 @@ class BundleTests(unittest.TestCase):
         with self.assertRaisesRegex(bundle.BundleError, "Duplicate"):
             bundle.read_binaries(path)
 
-    def test_github_build_is_matched_to_its_request_and_source_commit(self):
-        calls = []
-        def gh(argv, **kwargs):
-            argv = list(map(str, argv))
-            calls.append(argv)
-            if argv[:3] == ["git", "rev-parse", "HEAD"]:
-                return "abc123\n"
-            if argv[:2] == ["git", "status"]:
-                return ""
-            if argv[:2] == ["gh", "api"]:
-                return '{"sha":"abc123"}'
-            if argv[:3] == ["gh", "run", "list"]:
-                return json.dumps([{"databaseId": 42, "displayTitle": "Windows binaries request", "headSha": "abc123"}])
-            return ""
-        with patch.object(bundle, "run", side_effect=gh), patch.object(bundle.shutil, "which", return_value="gh"), patch.object(bundle.uuid, "uuid4") as request:
-            request.return_value.hex = "request"
-            destination = self.directory / "download"
-            self.assertEqual(bundle.fetch_binaries(destination, "owner/repo", "main"), destination)
-        self.assertTrue(any(command[:3] == ["gh", "workflow", "run"] for command in calls))
-        self.assertTrue(any(command[:4] == ["gh", "run", "watch", "42"] for command in calls))
-        self.assertTrue(any(command[:4] == ["gh", "run", "download", "42"] for command in calls))
+    def test_source_allowlist_excludes_caches_keys_and_rejects_links(self):
+        root = self.directory / "source"
+        for name, data in bundle.source_files().items():
+            path = root / name
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_bytes(data)
+        for name in ("key/secret.pem", ".git/config", "client/desktop/node_modules/cache.js", "client/desktop/src-tauri/target/generated.rs", "client/desktop/src-tauri/gen/capabilities.json"):
+            path = root / name
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_bytes(b"do not distribute")
+        files = bundle.source_files(root)
+        self.assertFalse(any(b"do not distribute" in data for data in files.values()))
+        link = root / "client/src/linked.rs"
+        link.symlink_to(self.key_dir / "client")
+        with self.assertRaisesRegex(bundle.BundleError, "linked"):
+            bundle.source_files(root)
+
+    def test_existing_identity_is_read_from_config(self):
+        self.config["ssh"]["identity_file"] = "~/.ssh/my_existing_key"
+        self.config_path.write_text(json.dumps(self.config))
+        output = bundle.package(self.args)
+        with zipfile.ZipFile(output) as archive:
+            self.assertEqual(json.loads(archive.read("services.json"))["ssh"]["identity_file"], "~/.ssh/my_existing_key")
+
+    def test_prebuilt_binaries_can_still_be_used_locally(self):
+        self.args.windows_artifact = self.native
+        output = bundle.package(self.args)
+        with zipfile.ZipFile(output) as archive:
+            self.assertIn("sservcli-desktop.exe", archive.namelist())
+            self.assertNotIn("Build.cmd", archive.namelist())
+
+    def test_validation_rejects_invalid_types_fields_and_service_settings(self):
+        for mutation in range(7):
+            config = json.loads(json.dumps(self.config))
+            if mutation == 0: config["ssh"]["port"] = True
+            elif mutation == 1: config["services"][1]["local_port"] = config["services"][0]["local_port"]
+            elif mutation == 2: config["services"][0]["remote_host"] = "0.0.0.0"
+            elif mutation == 3: config["services"][0]["launch"] = ["tool", "{unknown}"]
+            elif mutation == 4: config["services"][0]["path"] = "//example.com"
+            elif mutation == 5: config["reconnect"]["enabled"] = "yes"
+            else: config["ssh"]["typo"] = "ignored"
+            with self.subTest(mutation=mutation), self.assertRaises(bundle.BundleError):
+                bundle.validate_profile(config)
 
 
 if __name__ == "__main__":

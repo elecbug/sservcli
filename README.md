@@ -144,73 +144,72 @@ the same server and use the same destination restrictions.
 
 ## Optional setup with a restricted server account
 
-### One command: server setup and a ready Windows ZIP
+### One command: server setup and a build-ready Windows source ZIP
 
-On the Ubuntu server, supply the existing Windows client's **Ed25519 public key**
-and a reachable server address:
-
-```sh
-make bundle SERVER_HOST=203.0.113.10 PUBKEY_FILE=/path/to/client-id_ed25519.pub \
-  FALLBACK_HOSTS='["203.0.113.11", "192.0.2.10"]'
-```
-
-This builds the local profile validator, requests a native Windows build on
-GitHub Actions, enables/starts OpenSSH and creates missing host keys, installs
-the new forwarding-only account, registers the supplied client public key, and
-publishes `dist/sservcli-windows-svc_tunnel.zip`. Privileged setup uses `sudo`
-after native binaries and profile validation succeed. Your client private key
-stays on Windows and is never uploaded to CI or included in the ZIP.
-
-The native build requires a committed, pushed source revision containing
-`.github/workflows/windows-binaries.yml` and `gh auth login` on the server.
-The workflow must first be available on the repository's default branch for
-[manual dispatch](https://docs.github.com/en/actions/reference/workflows-and-actions/events-that-trigger-workflows#workflow_dispatch).
-Run `make bundle` as your normal user so GitHub CLI can use that login. The
-command also requires Rust/Cargo, Python 3.10+, OpenSSH server/client, and sudo.
-The remote revision must match local HEAD; uncommitted source is refused.
-For an existing native build, skip GitHub entirely:
+Configure two values: `PUBKEY_FILE`, the existing Windows client's **Ed25519
+public key**, and `CONFIG`, the services JSON file. Start from the example:
 
 ```sh
-make bundle SERVER_HOST=203.0.113.10 PUBKEY_FILE=/path/to/client.pub \
-  WINDOWS_ARTIFACT=/path/to/sservcli-windows-binaries.zip
+cp client/examples/services.json services.json
+# Edit services.json: ssh.host, ssh.fallback_hosts, ssh.user, and service ports.
+make bundle PUBKEY_FILE=/path/to/client-id_ed25519.pub CONFIG=services.json
 ```
 
-`WINDOWS_ARTIFACT` can also be a directory containing native Windows x64
-`sservcli.exe` and `sservcli-desktop.exe` built from the current source. The
-workflow's `sservcli-windows-binaries` artifact provides these files. Linux
-executables renamed to `.exe` are rejected. Native builds occur before account
-creation; a late packaging failure attempts to remove the newly created account.
+All connection settings come from `CONFIG`: server address, ordered fallback
+array, SSH port, new forwarding-only username, existing Windows identity path,
+and service definitions. Set `ssh.identity_file` to `null` for Agent/default
+identities, or to an existing Windows-side path such as `~/.ssh/id_ed25519`.
+Set `ssh.host` to a real address rather than the example hostname. The SSH port
+must already match the server's sshd configuration.
 
-Preview without changing accounts, SSH services, or dispatching a remote build:
+The command validates the JSON and public key, gathers the local source/build
+inputs, enables/starts OpenSSH and creates missing host keys, creates the new
+account named by `ssh.user`, registers the client public key, and writes
+`dist/sservcli-windows-<ssh.user>-source.zip`. The generated client profile uses
+the server's actual public host key automatically, replacing the example's
+`known_hosts_file` setting. Privileged account setup uses `sudo`.
+
+Packaging requires Python 3.10+, Make, OpenSSH server/client, and sudo on Ubuntu.
+It requires no `gh`, Git checkout/commit/push, Rust/Cargo, Node.js, or Windows
+build on the server. Local uncommitted source edits are included. The ZIP uses
+an explicit build-input allowlist, excluding `.git`, build caches, generated
+files, and private key directories. Your existing client private key stays on
+Windows and is never copied into the archive.
+
+Preview without changing accounts, SSH services, or writing the final ZIP:
 
 ```sh
-make bundle DRY_RUN=1 SERVER_HOST=203.0.113.10 PUBKEY_FILE=/path/to/client.pub
+make bundle PUBKEY_FILE=/path/to/client.pub CONFIG=services.json DRY_RUN=1
 ```
 
-Other options are `TUNNEL_USER`, `CONFIG`, `SERVER_PORT`, `CLIENT_IDENTITY`,
-`HOST_KEY_FILE`, `WINDOWS_REPO`, `WINDOWS_REF`, and `BUNDLE_OUTPUT`. The default
-services come from `services.json` when present, otherwise the example profile.
-`CLIENT_IDENTITY="~/.ssh/id_ed25519"` selects an existing Windows-side key path;
-by default Agent/default identities are used. `SERVER_PORT` must match an SSH
-port already configured on the server. Existing users, managed accounts, and
-existing output ZIPs are refused; choose a new account/output or administer the
-existing account explicitly.
+The ZIP contains the Rust workspace, desktop HTML/CSS/JavaScript, dependency
+lockfiles, required icons/capabilities, the prepared `services.json`, server host
+public key, `Build.cmd`, `Start.cmd`, a short README, and SHA-256 checksums.
+After extracting it on Windows:
 
-The ZIP contains both executables, `services.json` with the server host public
-key and fallback array, `server-host-key.pub`, `Start.cmd`, a short README, and
-SHA-256 checksums. Download and extract the whole ZIP on Windows, then run
-**Start.cmd**. It loads the adjacent profile and starts all enabled forwards in
-the background. Native OpenSSH Client and WebView2 must be available on Windows,
-and the existing identity must be usable there. No client password or private
-key is distributed.
+1. Install current stable Rust with the MSVC toolchain, Node.js, Microsoft C++
+   Build Tools, WebView2, and native OpenSSH Client.
+2. Run **Build.cmd** in Windows Terminal. It installs the declared npm packages,
+   builds the CLI and desktop locally with the lockfiles, and places both `.exe`
+   files beside `services.json`. Cargo/npm need their normal dependency access.
+3. Run **Start.cmd** to load that profile and forward every enabled service in
+   the background. Your existing identity or SSH Agent must be usable on Windows.
+
+For an already-built local binary ZIP/directory, `WINDOWS_ARTIFACT` is optional;
+it must contain Windows x64 `sservcli.exe` and `sservcli-desktop.exe`. This mode
+also uses no remote build. `BUNDLE_OUTPUT` overrides the destination ZIP, and
+`HOST_KEY_FILE` selects a nondefault active server host public key. Existing
+accounts/homes and output ZIPs are refused; choose a new `ssh.user` or output
+path. A late packaging failure attempts to remove only the newly created account.
 
 Download using your existing administrator SSH account, because the new
 forwarding-only account intentionally has no SFTP/SCP sessions. For example,
 from Windows PowerShell (replace the server path and administrator username):
 
 ```powershell
-scp.exe admin@203.0.113.10:/path/to/sservcli/dist/sservcli-windows-svc_tunnel.zip .
-Expand-Archive .\sservcli-windows-svc_tunnel.zip -DestinationPath .\sservcli-client
+scp.exe admin@203.0.113.10:/path/to/sservcli/dist/sservcli-windows-svc_tunnel-source.zip .
+Expand-Archive .\sservcli-windows-svc_tunnel-source.zip -DestinationPath .\sservcli-client
+.\sservcli-client\Build.cmd
 .\sservcli-client\Start.cmd
 ```
 
@@ -531,7 +530,8 @@ make integration  # Real temporary OpenSSH daemon and loopback services
 Integration tests also cover supplied host keys, existing Agent authentication,
 ordered fallback addresses, and first-time profile creation. Packaging tests use
 real key/profile validation and ZIP contents while mocking privileged account
-changes and GitHub dispatch; they do not create real users or run remote builds.
+changes. They check CONFIG-driven settings, complete build inputs, private-key
+exclusion, and the absence of build/network commands during source packaging.
 
 Integration tests require an installed OpenSSH server, a usable local user, and
 the platform's SSH privilege-separation runtime directory (on Ubuntu,
