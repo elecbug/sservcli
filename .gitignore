@@ -8,4 +8,5 @@
 *.key
 .DS_Store
 key/*
+env/*
 !.gitkeep
