@@ -1,0 +1,12 @@
+[package]
+name = "sservcli"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "Access multiple server services through one restricted SSH connection"
+
+[dependencies]
+serde.workspace = true
+serde_json.workspace = true
+libc.workspace = true

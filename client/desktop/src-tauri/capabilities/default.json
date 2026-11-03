@@ -1,0 +1,7 @@
+{
+  "$schema": "../gen/schemas/desktop-schema.json",
+  "identifier": "main-window",
+  "description": "Local connection manager only; no remote origins or shell plugin",
+  "windows": ["main"],
+  "permissions": ["core:default"]
+}

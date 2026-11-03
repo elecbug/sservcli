@@ -1,0 +1,9 @@
+/target/
+**/target/
+**/node_modules/
+**/__pycache__/
+*.pyc
+/services.json
+*.pem
+*.key
+.DS_Store
