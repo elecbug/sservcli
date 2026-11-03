@@ -23,3 +23,25 @@ jobs:
       - run: sudo apt-get update && sudo apt-get install -y libwebkit2gtk-4.1-dev build-essential libxdo-dev libssl-dev libayatana-appindicator3-dev librsvg2-dev
       - run: npm ci && npm run build
         working-directory: client/desktop
+  windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+      - run: cargo test --workspace --locked
+      - run: cargo build --workspace --release --locked
+      - run: .\target\release\sservcli.exe check --config client/examples/services.windows.json
+      - run: node --check client/desktop/ui/app.js
+      - run: npm.cmd ci
+        working-directory: client/desktop
+      - run: npm.cmd run build
+        working-directory: client/desktop
+      - uses: actions/upload-artifact@v4
+        with:
+          name: sservcli-windows-x64
+          path: |
+            target/release/sservcli.exe
+            client/desktop/src-tauri/target/release/sservcli-desktop.exe

@@ -1,18 +1,10 @@
-use sservcli::{config::Kind, tunnel::ssh_args, Config, Tunnel};
-use std::{
-    path::PathBuf,
-    sync::atomic::{AtomicBool, Ordering},
-    thread,
-    time::Duration,
-};
-
-static STOP: AtomicBool = AtomicBool::new(false);
-extern "C" fn stop(_: libc::c_int) {
-    STOP.store(true, Ordering::SeqCst);
-}
+use sservcli::{config::Kind, platform, tunnel::ssh_args, Config, Tunnel};
+use std::{path::PathBuf, thread, time::Duration};
 
 fn main() {
-    if let Err(e) = run() {
+    let result = run();
+    platform::shutdown_complete();
+    if let Err(e) = result {
         eprintln!("sservcli: {e}");
         std::process::exit(1);
     }
@@ -71,14 +63,7 @@ fn run() -> Result<(), String> {
     }
     let config = config.resolved(&profile)?;
     if command == "command" {
-        println!(
-            "ssh {}",
-            ssh_args(&config, None)
-                .iter()
-                .map(|arg| format!("'{}'", arg.replace('\'', "'\\''")))
-                .collect::<Vec<_>>()
-                .join(" ")
-        );
+        println!("{}", platform::format_ssh_command(&ssh_args(&config, None)));
         return Ok(());
     }
     let service = open
@@ -92,16 +77,12 @@ fn run() -> Result<(), String> {
                 .ok_or_else(|| format!("Unknown or disabled service: {id}"))
         })
         .transpose()?;
-    #[cfg(unix)]
-    unsafe {
-        libc::signal(libc::SIGINT, stop as libc::sighandler_t);
-        libc::signal(libc::SIGTERM, stop as libc::sighandler_t);
-    }
+    platform::install_shutdown_handler()?;
     let mut tunnel = Tunnel::default();
     tunnel.connect(config)?;
     let mut previous = String::new();
     let mut opened = false;
-    while !STOP.load(Ordering::SeqCst) {
+    while !platform::shutdown_requested() {
         let snapshot = tunnel.snapshot();
         if snapshot.message != previous {
             eprintln!("[{}] {}", snapshot.status, snapshot.message);

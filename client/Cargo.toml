@@ -9,4 +9,6 @@ description = "Access multiple server services through one restricted SSH connec
 [dependencies]
 serde.workspace = true
 serde_json.workspace = true
+
+[target.'cfg(unix)'.dependencies]
 libc.workspace = true

@@ -210,26 +210,41 @@ impl Config {
         let base = fs::canonicalize(profile).map_err(|e| format!("{}: {e}", profile.display()))?;
         let base = base.parent().ok_or("Profile has no parent directory")?;
         let mut result = self.clone();
-        result.ssh.known_hosts_file = resolve_path(&self.ssh.known_hosts_file, base)?
-            .to_string_lossy()
-            .into_owned();
+        result.ssh.known_hosts_file =
+            crate::platform::ssh_path(&resolve_path(&self.ssh.known_hosts_file, base)?)?;
         result.ssh.identity_file = self
             .ssh
             .identity_file
             .as_ref()
-            .map(|p| resolve_path(p, base).map(|p| p.to_string_lossy().into_owned()))
+            .map(|p| resolve_path(p, base).and_then(|p| crate::platform::ssh_path(&p)))
             .transpose()?;
         Ok(result)
     }
 }
 
 fn resolve_path(value: &str, base: &Path) -> Result<PathBuf, String> {
+    #[cfg(windows)]
+    let value = value.replace('\\', "/");
+    #[cfg(windows)]
+    let value = value.as_str();
     if let Some(rest) = value.strip_prefix("~/") {
-        let home = std::env::var_os("HOME").ok_or("HOME is not set; use an absolute SSH path")?;
+        let home = crate::platform::home_dir()
+            .ok_or("Home directory is not set; use an absolute SSH path")?;
         Ok(PathBuf::from(home).join(rest))
     } else if value.starts_with('~') {
         Err("Only ~/ home expansion is supported".into())
     } else {
+        #[cfg(windows)]
+        if !Path::new(value).is_absolute()
+            && Path::new(value)
+                .components()
+                .any(|p| matches!(p, std::path::Component::Prefix(_)))
+        {
+            return Err(
+                "Drive-relative SSH paths are unsupported; use C:/path or a profile-relative path"
+                    .into(),
+            );
+        }
         Ok(base.join(value))
     }
 }
@@ -243,24 +258,22 @@ impl Service {
         format!("{scheme}://127.0.0.1:{}{}", self.local_port, self.path)
     }
 
-    pub fn launch_argv(&self) -> Result<Vec<String>, String> {
+    /// None selects the platform's default browser; Some contains a local
+    /// executable and arguments passed directly to process creation.
+    pub fn launch_argv(&self) -> Result<Option<Vec<String>>, String> {
         if let Some(argv) = &self.launch {
-            return Ok(argv
-                .iter()
-                .map(|arg| {
-                    arg.replace("{host}", "127.0.0.1")
-                        .replace("{port}", &self.local_port.to_string())
-                        .replace("{url}", &self.url())
-                })
-                .collect());
+            return Ok(Some(
+                argv.iter()
+                    .map(|arg| {
+                        arg.replace("{host}", "127.0.0.1")
+                            .replace("{port}", &self.local_port.to_string())
+                            .replace("{url}", &self.url())
+                    })
+                    .collect(),
+            ));
         }
         if matches!(self.kind, Kind::Web | Kind::Api) {
-            let opener = if cfg!(target_os = "macos") {
-                "open"
-            } else {
-                "xdg-open"
-            };
-            return Ok(vec![opener.into(), self.url()]);
+            return Ok(None);
         }
         Err(format!(
             "{}: configure a launch array for this service",
@@ -281,9 +294,29 @@ mod tests {
         let c = example();
         assert_eq!(c.services[0].url(), "http://127.0.0.1:18080/");
         assert_eq!(
-            c.services[1].launch_argv().unwrap(),
+            c.services[1].launch_argv().unwrap().unwrap(),
             ["psql", "-h", "127.0.0.1", "-p", "15432", "-U", "app", "app"]
         );
+    }
+
+    #[test]
+    fn default_browser_is_separate_from_local_command_execution() {
+        let c = example();
+        assert!(c.services[0].launch_argv().unwrap().is_none());
+        assert!(c.services[2].launch_argv().unwrap().is_none());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_home_and_profile_relative_paths() {
+        let base = Path::new("C:/Profiles/한 글");
+        assert_eq!(
+            resolve_path(r".ssh\known_hosts", base).unwrap(),
+            base.join(".ssh/known_hosts")
+        );
+        let expected = PathBuf::from(crate::platform::home_dir().unwrap()).join(".ssh/id_ed25519");
+        assert_eq!(resolve_path(r"~\.ssh\id_ed25519", base).unwrap(), expected);
+        assert!(resolve_path("C:relative", base).is_err());
     }
     #[test]
     fn rejects_unsafe_or_ambiguous_profiles() {

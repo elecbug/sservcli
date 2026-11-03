@@ -9,7 +9,7 @@ use std::{
     process::{Child, Command, Stdio},
     sync::{mpsc, Arc, Mutex},
     thread::{self, JoinHandle},
-    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
+    time::{Duration, Instant},
 };
 
 #[derive(Clone, Debug, Serialize)]
@@ -56,9 +56,6 @@ impl Tunnel {
     }
 
     pub fn connect(&mut self, config: Config) -> Result<(), String> {
-        if !cfg!(unix) {
-            return Err("This MVP requires Linux or macOS OpenSSH control sockets".into());
-        }
         config.validate()?;
         if self.worker.as_ref().is_some_and(|w| !w.is_finished()) {
             return Err("Disconnect the current connection first".into());
@@ -74,18 +71,18 @@ impl Tunnel {
                 return Err(format!("Identity file does not exist: {path}"));
             }
         }
-        if !Command::new("ssh")
+        if !crate::platform::ssh_command()
             .arg("-V")
             .stdout(Stdio::null())
             .stderr(Stdio::null())
             .status()
-            .map_err(|e| format!("OpenSSH is required: {e}"))?
+            .map_err(|e| format!("OpenSSH client is required (on Windows, enable the OpenSSH Client optional feature): {e}"))?
             .success()
         {
             return Err("Could not run OpenSSH".into());
         }
         check_ports(&config)?;
-        let directory = ControlDirectory::new()?;
+        let directory = ConnectionControl::new()?;
         let (tx, rx) = mpsc::channel();
         let state = self.state.clone();
         update(
@@ -167,7 +164,6 @@ pub fn ssh_args(config: &Config, control: Option<&Path>) -> Vec<String> {
         "ForwardAgent=no",
         "ForwardX11=no",
         "GatewayPorts=no",
-        "ControlPersist=no",
         "LogLevel=VERBOSE",
     ] {
         args.extend(["-o".into(), option.into()]);
@@ -176,20 +172,26 @@ pub fn ssh_args(config: &Config, control: Option<&Path>) -> Vec<String> {
         "-o".into(),
         format!("UserKnownHostsFile=\"{}\"", config.ssh.known_hosts_file),
     ]);
-    if let Some(control) = control {
-        args.extend([
-            "-M".into(),
-            "-S".into(),
-            control.to_string_lossy().into_owned(),
-        ]);
-    } else {
-        args.extend([
-            "-o".into(),
-            "ControlMaster=no".into(),
-            "-S".into(),
-            "none".into(),
-        ]);
+    #[cfg(unix)]
+    {
+        args.extend(["-o".into(), "ControlPersist=no".into()]);
+        if let Some(control) = control {
+            args.extend([
+                "-M".into(),
+                "-S".into(),
+                control.to_string_lossy().into_owned(),
+            ]);
+        } else {
+            args.extend([
+                "-o".into(),
+                "ControlMaster=no".into(),
+                "-S".into(),
+                "none".into(),
+            ]);
+        }
     }
+    #[cfg(not(unix))]
+    let _ = control; // Native Windows OpenSSH does not implement multiplexing.
     if let Some(identity) = &config.ssh.identity_file {
         args.extend([
             "-o".into(),
@@ -217,34 +219,65 @@ pub fn ssh_args(config: &Config, control: Option<&Path>) -> Vec<String> {
     args
 }
 
-struct ControlDirectory(PathBuf);
-impl ControlDirectory {
+struct ConnectionControl(Option<PathBuf>);
+impl ConnectionControl {
     fn new() -> Result<Self, String> {
-        // Keep the Unix-domain socket below the platform's short pathname limit.
-        let stamp = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .map_err(|e| e.to_string())?
-            .as_nanos();
-        let path = PathBuf::from(format!("/tmp/sservcli-{}-{stamp:x}", std::process::id()));
-        let mut builder = fs::DirBuilder::new();
+        #[cfg(not(unix))]
+        {
+            Ok(Self(None))
+        }
         #[cfg(unix)]
         {
-            use std::os::unix::fs::DirBuilderExt;
-            builder.mode(0o700);
+            use std::time::{SystemTime, UNIX_EPOCH};
+            // Keep the Unix-domain socket below the platform's short pathname limit.
+            let stamp = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .map_err(|e| e.to_string())?
+                .as_nanos();
+            let path = PathBuf::from(format!("/tmp/sservcli-{}-{stamp:x}", std::process::id()));
+            let mut builder = fs::DirBuilder::new();
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::DirBuilderExt;
+                builder.mode(0o700);
+            }
+            builder
+                .create(&path)
+                .map_err(|e| format!("Cannot create private SSH control directory: {e}"))?;
+            Ok(Self(Some(path)))
         }
-        builder
-            .create(&path)
-            .map_err(|e| format!("Cannot create private SSH control directory: {e}"))?;
-        Ok(Self(path))
     }
 }
-impl Drop for ControlDirectory {
+impl Drop for ConnectionControl {
     fn drop(&mut self) {
-        let _ = fs::remove_dir_all(&self.0);
+        if let Some(path) = &self.0 {
+            let _ = fs::remove_dir_all(path);
+        }
     }
 }
 
-struct SshChild(Child);
+struct SshChild(Child, #[cfg(windows)] crate::windows::ChildJob);
+impl SshChild {
+    fn new(child: Child) -> Result<Self, String> {
+        #[cfg(windows)]
+        {
+            let mut child = child;
+            let job = match crate::windows::ChildJob::attach(&child) {
+                Ok(job) => job,
+                Err(error) => {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    return Err(error);
+                }
+            };
+            Ok(Self(child, job))
+        }
+        #[cfg(not(windows))]
+        {
+            Ok(Self(child))
+        }
+    }
+}
 impl Drop for SshChild {
     fn drop(&mut self) {
         let _ = self.0.kill();
@@ -258,11 +291,11 @@ fn stopped(rx: &mpsc::Receiver<()>, delay: Duration) -> bool {
 
 fn supervise(
     config: Config,
-    directory: ControlDirectory,
+    directory: ConnectionControl,
     state: Arc<Mutex<Snapshot>>,
     stop: mpsc::Receiver<()>,
 ) {
-    let socket = directory.0.join("ssh");
+    let socket = directory.0.as_ref().map(|dir| dir.join("ssh"));
     let mut retries = 0;
     loop {
         if stopped(&stop, Duration::ZERO) {
@@ -272,8 +305,10 @@ fn supervise(
             update(&state, "failed", e, retries);
             return;
         }
-        let _ = fs::remove_file(&socket);
-        let outcome = run_connection(&config, &socket, &state, &stop, retries);
+        if let Some(socket) = &socket {
+            let _ = fs::remove_file(socket);
+        }
+        let outcome = run_connection(&config, socket.as_deref(), &state, &stop, retries);
         match outcome {
             Ok(()) => break,
             Err((message, was_connected)) => {
@@ -323,19 +358,19 @@ fn supervise(
 
 fn run_connection(
     config: &Config,
-    socket: &Path,
+    socket: Option<&Path>,
     state: &Arc<Mutex<Snapshot>>,
     stop: &mpsc::Receiver<()>,
     attempt: u32,
 ) -> Result<(), (String, bool)> {
-    let child = Command::new("ssh")
-        .args(ssh_args(config, Some(socket)))
+    let child = crate::platform::ssh_command()
+        .args(ssh_args(config, socket))
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::piped())
         .spawn()
         .map_err(|e| (format!("Cannot start SSH: {e}"), false))?;
-    let mut child = SshChild(child);
+    let mut child = SshChild::new(child).map_err(|e| (e, false))?;
     let stderr = child.0.stderr.take().unwrap();
     let logs = state.clone();
     let reader = thread::spawn(move || {
@@ -377,16 +412,12 @@ fn run_connection(
             Err(e) => break Err((format!("Cannot inspect SSH process: {e}"), connected)),
             _ => {}
         }
-        if !connected && socket.exists() {
-            let ready = Command::new("ssh")
-                .args(["-F", "none", "-S"])
-                .arg(socket)
-                .args(["-O", "check", &config.ssh.host])
-                .stdin(Stdio::null())
-                .stdout(Stdio::null())
-                .stderr(Stdio::null())
-                .status();
-            if ready.is_ok_and(|s| s.success()) {
+        if !connected {
+            let ready = match connection_ready(config, socket, child.0.id()) {
+                Ok(ready) => ready,
+                Err(error) => break Err((error, false)),
+            };
+            if ready {
                 connected = true;
                 update(
                     state,
@@ -405,13 +436,45 @@ fn run_connection(
     result
 }
 
+fn connection_ready(config: &Config, socket: Option<&Path>, pid: u32) -> Result<bool, String> {
+    #[cfg(windows)]
+    {
+        let _ = socket;
+        let ports: Vec<_> = config
+            .services
+            .iter()
+            .filter(|s| s.enabled)
+            .map(|s| s.local_port)
+            .collect();
+        crate::windows::listeners_owned_by(pid, &ports)
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = pid;
+        let Some(socket) = socket.filter(|path| path.exists()) else {
+            return Ok(false);
+        };
+        let ready = crate::platform::ssh_command()
+            .args(["-F", "none", "-S"])
+            .arg(socket)
+            .args(["-O", "check", &config.ssh.host])
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status();
+        Ok(ready.is_ok_and(|s| s.success()))
+    }
+}
+
 /// Profiles are trusted local code: launch arrays name local executables.
 /// Service credentials stay in the service's own client/keychain, never here.
 pub fn launch(service: &Service) -> Result<(), String> {
     if !service.enabled {
         return Err("Enable and connect this service first".into());
     }
-    let argv = service.launch_argv()?;
+    let Some(argv) = service.launch_argv()? else {
+        return crate::platform::open_url(&service.url());
+    };
     // Terminal applications (e.g. psql) inherit CLI stdio. A desktop user should
     // configure a terminal emulator or GUI client in the launch array.
     let mut child = Command::new(&argv[0])
@@ -451,12 +514,30 @@ mod tests {
         config.services[0].local_port = listener.local_addr().unwrap().port();
         assert!(check_ports(&config).unwrap_err().contains("unavailable"));
     }
+    #[cfg(windows)]
+    #[test]
+    fn windows_uses_no_multiplexing_and_requires_the_ssh_process_to_own_ports() {
+        let mut config = Config::parse(include_str!("../examples/services.json")).unwrap();
+        let args = ssh_args(&config, Some(Path::new("C:/unused-control-socket")));
+        assert!(!args
+            .iter()
+            .any(|a| a == "-M" || a == "-S" || a.starts_with("Control")));
+        for service in &mut config.services {
+            service.enabled = false;
+        }
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        config.services[0].enabled = true;
+        config.services[0].local_port = listener.local_addr().unwrap().port();
+        assert!(connection_ready(&config, None, std::process::id()).unwrap());
+        assert!(!connection_ready(&config, None, 0).unwrap());
+    }
+    #[cfg(unix)]
     #[test]
     fn control_directory_is_private_and_removed() {
         let path;
         {
-            let dir = ControlDirectory::new().unwrap();
-            path = dir.0.clone();
+            let dir = ConnectionControl::new().unwrap();
+            path = dir.0.clone().unwrap();
             #[cfg(unix)]
             {
                 use std::os::unix::fs::PermissionsExt;

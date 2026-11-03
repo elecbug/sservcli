@@ -49,6 +49,11 @@ fn get_state(state: State<Shared>) -> Result<View, String> {
 
 #[tauri::command]
 fn example_profile() -> String {
+    #[cfg(windows)]
+    {
+        include_str!("../../../examples/services.windows.json").into()
+    }
+    #[cfg(not(windows))]
     include_str!("../../../examples/services.json").into()
 }
 
@@ -100,6 +105,7 @@ fn save_profile(path: String, text: String, state: State<Shared>) -> Result<View
             .map_err(|e| e.to_string())?;
         output.write_all(b"\n").map_err(|e| e.to_string())?;
         output.sync_all().map_err(|e| e.to_string())?;
+        drop(output);
         fs::rename(&temp, &path).map_err(|e| e.to_string())
     })();
     if result.is_err() {

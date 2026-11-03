@@ -34,25 +34,32 @@ flowchart LR
 | PostgreSQL | `127.0.0.1:5432` | `127.0.0.1:15432` |
 | REST API | `127.0.0.1:9000` | `http://127.0.0.1:19000/docs` |
 
-All enabled forwards belong to a single SSH process. A private OpenSSH control
-socket confirms successful authentication and listener setup. Keepalives detect
-broken transports. Interrupted connections use bounded exponential backoff;
+All enabled forwards belong to a single SSH process. On Unix, a private OpenSSH
+control socket confirms successful authentication and listener setup. On Windows,
+the native TCP table must show that this SSH process owns every enabled loopback
+listener; an unrelated process listening on the same port cannot satisfy this
+check. Keepalives detect broken transports. Interrupted connections use bounded exponential backoff;
 initial authentication, host-key, or listener failures stop immediately.
 
 ## Requirements
 
-- **CLI:** Linux or macOS, OpenSSH client with control socket support, Rust 1.75+
+- **CLI:** Windows 10/11, Linux, or macOS, an OpenSSH client, Rust 1.75+
   and Cargo to build. The core has no GTK, Node.js, or Tauri dependency.
-- **Desktop:** Linux or macOS, current stable Rust, Node.js 20.19+ or 22.12+,
+- **Desktop:** Windows 10/11, Linux, or macOS, current stable Rust, Node.js 20.19+ or 22.12+,
   and the [Tauri 2 platform prerequisites](https://v2.tauri.app/start/prerequisites/).
   Linux requires the GTK/WebKit development libraries listed there. Current
   Tauri dependencies may need a newer compiler than Tauri's original minimum.
+  Windows development requires Microsoft C++ Build Tools, an MSVC Rust toolchain,
+  and the WebView2 runtime described in those prerequisites.
 - **Server provisioning:** Ubuntu with Python 3.10+, OpenSSH server, systemd,
   `useradd`, `userdel`, `pkill`, and root access. The default systemd unit is `ssh`.
 - **Service clients:** Your browser, `psql`, or any other configured executable.
 
-Windows support is not implemented in this MVP: the connection manager requires
-Unix OpenSSH control sockets.
+Windows uses native OpenSSH without Unix control sockets. The Windows optional
+OpenSSH Client feature is preferred over Git/WSL SSH wrappers; portable native
+`ssh.exe` on `PATH` is used if the Windows system copy is absent. Server
+provisioning remains an Ubuntu administrator task; Windows clients connect to
+the same server and use the same destination restrictions.
 
 ## Quick start
 
@@ -183,6 +190,78 @@ the desktop, choose a GUI database client or an installed terminal emulator:
 "launch": ["x-terminal-emulator", "-e", "psql", "-h", "{host}", "-p", "{port}", "-U", "app", "app"]
 ```
 
+### Windows setup (PowerShell)
+
+Enable the **OpenSSH Client** optional feature if `ssh.exe -V` is unavailable.
+Microsoft documents installation in its
+[OpenSSH for Windows guide](https://learn.microsoft.com/en-us/windows-server/administration/openssh/openssh_install_firstuse).
+In an administrator PowerShell session:
+
+```powershell
+Add-WindowsCapability -Online -Name OpenSSH.Client~~~~0.0.1.0
+Set-Service -Name ssh-agent -StartupType Automatic
+Start-Service ssh-agent
+```
+
+Back in your normal PowerShell session, create your client identity and profile:
+
+```powershell
+New-Item -ItemType Directory -Force "$env:USERPROFILE/.ssh" | Out-Null
+ssh-keygen.exe -t ed25519 -f "$env:USERPROFILE/.ssh/sservcli" -C sservcli
+ssh-add.exe "$env:USERPROFILE/.ssh/sservcli"
+Copy-Item client/examples/services.windows.json services.json
+```
+
+Set the real server hostname in `services.json`, then provision the Ubuntu server
+with your public key as described above. The
+[Windows example](client/examples/services.windows.json) launches PostgreSQL in
+Windows Terminal (`wt.exe`) and expects `psql.exe` on `PATH`. Install those tools
+or replace `launch` with your database client's executable and arguments. A GUI
+client can be specified using an absolute executable path, such as
+`C:/Program Files/YourClient/client.exe`.
+
+Obtain and verify the server host public key and fingerprint through the same
+trusted administrator channel described in step 3. After verifying the trusted
+copy named `server-host-key.pub`, add its key to your Windows host-key database:
+
+```powershell
+ssh-keygen.exe -lf .\server-host-key.pub
+$keyFields = (Get-Content .\server-host-key.pub -Raw).Trim() -split '\s+'
+$entry = 'server.example.com {0} {1}' -f $keyFields[0], $keyFields[1]
+Add-Content -Path "$env:USERPROFILE/.ssh/known_hosts" -Value $entry -Encoding ascii
+```
+
+Replace the hostname; for a nonstandard port, use `[server.example.com]:2222`.
+Then build and connect:
+
+```powershell
+cargo build --release --locked
+.\target\release\sservcli.exe check --config services.json
+.\target\release\sservcli.exe connect --config services.json --open dashboard
+```
+
+Ctrl+C or Ctrl+Break disconnects and releases the forwarded ports. The managed
+SSH process belongs to a Windows job that also terminates it if the application
+is closed abruptly. Background SSH processes run without extra console windows.
+
+For the desktop app, install the
+[Windows Tauri prerequisites](https://v2.tauri.app/start/prerequisites/#windows),
+then run:
+
+```powershell
+Set-Location client/desktop
+npm.cmd ci
+npm.cmd run dev
+# Build the standalone executable:
+npm.cmd run build
+```
+
+The executable is `client/desktop/src-tauri/target/release/sservcli-desktop.exe`.
+Its settings screen accepts a Windows profile path such as
+`C:/Users/YourName/services.json`. Browser services use the Windows default
+HTTP(S) association directly, including URLs with query strings and Unicode.
+The `command` subcommand prints PowerShell quoting on Windows.
+
 ## Profile reference
 
 See [`client/examples/services.json`](client/examples/services.json) for the
@@ -209,8 +288,12 @@ the client to catch misspelled settings.
 | `services[].scheme`, `path` | Browser URL scheme (`http`/`https`) and path; defaults `http`, `/` |
 | `services[].launch` | Optional local executable/argument array; no shell expansion |
 
-SSH paths are relative to the profile's directory; `~/` expands to your home
-directory. Other environment-variable and SSH `%` token expansions are not
+SSH paths are relative to the profile's directory; `~/` expands to `HOME` on Unix
+and `USERPROFILE` on Windows (falling back to `HOME` if needed). Windows also
+accepts `~\`, drive-absolute paths, and UNC paths. Prefer forward slashes in JSON,
+for example `C:/Users/Your Name/.ssh/known_hosts`; JSON backslashes must be escaped.
+Windows drive-relative paths such as `C:keys/id_ed25519` are rejected.
+Other environment-variable and SSH `%` token expansions are not
 supported. SSH config files are deliberately ignored (`-F none`), so aliases,
 ProxyJump, extra forwards, and `ProxyCommand` are not inherited.
 
@@ -218,8 +301,9 @@ Launch arguments accept `{host}`, `{port}`, and `{url}`. Executables are resolve
 through your local `PATH` or an explicit path. Profiles with launch commands are
 trusted local code: review them before opening a service. Store database and API
 credentials in the service's own client or keychain, rather than in this file.
-Web/API services without a launch array use `xdg-open` on Linux or `open` on
-macOS; database/TCP services require a launch array to use the launch button.
+Web/API services without a launch array use the native default browser on
+Windows, `xdg-open` on Linux, or `open` on macOS; database/TCP services require a
+launch array to use the launch button.
 
 Changing a client's destination does not authorize it on the server. The server
 renderer includes **all** listed services, even those disabled in the UI; the
@@ -292,9 +376,18 @@ shutdown, reconnection, and retry exhaustion. Server transaction tests mock
 account and systemd operations while using real temporary configuration files.
 
 The CLI/core and native UI use separate Cargo workspaces so core tests can run
-without desktop development libraries. On the initial development environment,
-Rust 1.75 supports the CLI; the desktop requires a newer toolchain and installed
-GTK/WebKit packages before it can be compiled and exercised.
+without desktop development libraries. On Windows, run
+`cargo test --workspace --locked`, `cargo build --release --locked`, and
+`node --check client/desktop/ui/app.js` directly in PowerShell; the Makefile and
+Python server tests use Unix tools. Windows unit tests exercise the native TCP
+listener table, ownership checks, Windows paths, and child-process job cleanup.
+The Windows CI job runs those tests, builds both `.exe` files, and uploads them
+as the `sservcli-windows-x64` artifact. Full temporary-sshd integration tests run
+on Linux; CI does not run a live Windows-to-server SSH session or automate the GUI.
+
+The local Linux development environment supports CLI builds and real SSH tests.
+Native Windows execution and the desktop UI need their respective platform
+toolchains; adding a CI job does not imply it has already passed remotely.
 
 ```text
 client/src/                  Shared Rust configuration, SSH supervisor, and CLI
