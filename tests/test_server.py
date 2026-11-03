@@ -16,7 +16,7 @@ spec.loader.exec_module(server)
 
 class PolicyTests(unittest.TestCase):
     def test_profile_and_restrictions(self):
-        args = argparse.Namespace(config=ROOT / "client/examples/services.json", user=None, permit_open=None)
+        args = argparse.Namespace(config=ROOT / "examples/services.json", user=None, permit_open=None)
         user, permitted = server.policy_input(args)
         text = server.policy(user, permitted)
         self.assertEqual(user, "svc_tunnel")

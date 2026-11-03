@@ -15,7 +15,7 @@ import threading
 import time
 import webbrowser
 
-from .config import ConfigError, launch_arguments, service_url, validate_profile
+from .config import ConfigError, launch_arguments, service_url, validate_profile, validate_token
 
 
 def openssh_program(name="ssh"):
@@ -102,6 +102,8 @@ def check_ports(config):
                 sockets.append(listener)
                 if os.name == "nt":
                     listener.setsockopt(socket.SOL_SOCKET, socket.SO_EXCLUSIVEADDRUSE, 1)
+                else:
+                    listener.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
                 try:
                     listener.bind(("127.0.0.1", service["local_port"]))
                 except OSError as error:
@@ -122,6 +124,7 @@ class Tunnel:
         self.events = queue.Queue()
         self._stop = threading.Event()
         self._worker = None
+        self._cancel = None
 
     def snapshot(self):
         with self._lock:
@@ -133,26 +136,43 @@ class Tunnel:
             self._logs.append(message)
         self.events.put((status, message))
 
-    def connect(self, config):
+    def connect(self, config, token=None):
         validate_profile(config)
         if self._worker and self._worker.is_alive():
             raise ConfigError("Disconnect the current connection first")
         self.disconnect()
-        openssh_program()
-        for field in ("known_hosts_file", "identity_file"):
-            if config["ssh"].get(field) and not Path(config["ssh"][field]).is_file():
-                raise ConfigError(f"{field} does not exist: {config['ssh'][field]}")
+        token_mode = config["version"] == 2
+        if token_mode:
+            validate_token(token)
+            if not config["ssh"].get("host_public_key"):
+                raise ConfigError("Import the server's client bundle or supply its public host key before connecting")
+            try:
+                from .token_tunnel import supervise
+                from .token_auth import public_key
+                public_key(config["ssh"]["host_public_key"])
+            except ImportError as error:
+                raise ConfigError("Install Python dependencies with make setup or Build.cmd") from error
+        else:
+            openssh_program()
+            for field in ("known_hosts_file", "identity_file"):
+                if config["ssh"].get(field) and not Path(config["ssh"][field]).is_file():
+                    raise ConfigError(f"{field} does not exist: {config['ssh'][field]}")
         check_ports(config)
         self._stop.clear()
         with self._lock:
             self._logs.clear()
             self._state["host_key_fingerprint"] = None
         self._update("connecting", "Preparing SSH connection")
-        self._worker = threading.Thread(target=self._supervise, args=(copy.deepcopy(config),), daemon=True)
+        target = supervise if token_mode else self._supervise
+        arguments = (self, copy.deepcopy(config), token) if token_mode else (copy.deepcopy(config),)
+        self._worker = threading.Thread(target=target, args=arguments, daemon=True)
         self._worker.start()
 
     def disconnect(self):
         self._stop.set()
+        cancel = self._cancel
+        if cancel:
+            cancel()
         if self._worker:
             self._worker.join(timeout=15)
             if self._worker.is_alive():
@@ -175,7 +195,7 @@ class Tunnel:
         except Exception as error:
             self._update("failed", str(error))
 
-    def _cycles(self, config, known, control):
+    def _cycles(self, config, known, control, connection=None):
         hosts = [config["ssh"]["host"], *config["ssh"].get("fallback_hosts", [])]
         reconnect = config.get("reconnect", {})
         maximum = reconnect.get("max_attempts", 5)
@@ -187,10 +207,10 @@ class Tunnel:
                     break
                 index = (first + offset) % len(hosts)
                 host = hosts[index]
-                self._update("connecting", f"Connecting to {host}:{config['ssh'].get('port', 22)} (address {offset + 1}/{len(hosts)})", retries)
+                self._update("connecting", f"Connecting to {host}:{config['ssh'].get('port', 8022 if config['version'] == 2 else 22)} (address {offset + 1}/{len(hosts)})", retries)
                 if control:
                     Path(control).unlink(missing_ok=True)
-                was_connected, message, fatal = self._connection(config, known, host, control, retries)
+                was_connected, message, fatal = (connection or self._connection)(config, known, host, control, retries)
                 if fatal:
                     self._update("failed", message, retries)
                     return

@@ -20,7 +20,7 @@ ROOT = Path(__file__).resolve().parents[1]
 
 class ClientTests(unittest.TestCase):
     def setUp(self):
-        self.config = json.loads((ROOT / "client/examples/services.json").read_text())
+        self.config = json.loads((ROOT / "examples/services.json").read_text())
         self.temp = tempfile.TemporaryDirectory()
         self.addCleanup(self.temp.cleanup)
         self.directory = Path(self.temp.name)
@@ -33,7 +33,7 @@ class ClientTests(unittest.TestCase):
         self.assertIn("http://127.0.0.1:18080/", output)
         self.assertIn("disabled", output)
         self.assertIn("127.0.0.1:15432", output)
-        validate_profile(load_profile(ROOT / "client/examples/services.windows.json"))
+        validate_profile(load_profile(ROOT / "examples/services.windows.json"))
 
     def test_strict_validation_rejects_unknown_fields_and_unsafe_values(self):
         changes = [lambda c: c["ssh"].update(port=True), lambda c: c.update(version=True),

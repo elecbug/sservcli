@@ -14,26 +14,50 @@ def check_runtime():
         import _tkinter
     except ImportError as error:
         raise RuntimeError("Install Python with Tcl/Tk enabled; tkinter is required for the desktop") from error
-    from .tunnel import openssh_program, process_options
-    for name in ("ssh", "ssh-keygen"):
-        program = openssh_program(name)
-        if name == "ssh":
-            result = subprocess.run([program, "-V"], capture_output=True, timeout=10, **process_options())
-            if result.returncode:
-                raise RuntimeError("OpenSSH Client could not start")
+    try:
+        import paramiko
+    except ImportError as error:
+        raise RuntimeError("Run Build.cmd once to install the Python SSH dependencies") from error
     return True
+
+
+def environment_python():
+    root = Path(__file__).resolve().parents[1]
+    directory = root / ".venv"
+    return directory / ("Scripts/python.exe" if os.name == "nt" else "bin/python")
+
+
+def setup_runtime():
+    if sys.version_info < (3, 11):
+        raise RuntimeError("Install Python 3.11 or newer with Tcl/Tk")
+    root = Path(__file__).resolve().parents[1]
+    python = environment_python()
+    if not python.is_file():
+        subprocess.run([sys.executable, "-m", "venv", str(root / ".venv")], check=True)
+    subprocess.run([str(python), "-m", "pip", "--disable-pip-version-check", "install", "--only-binary=:all:",
+                    "-r", str(root / "requirements.txt")], check=True)
+    subprocess.run([str(python), "-m", "sservcli.windows_launcher", "--check"], cwd=root, check=True)
 
 
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--check", action="store_true")
+    parser.add_argument("--setup", action="store_true")
     parser.add_argument("--start", action="store_true")
     parser.add_argument("--config", type=Path)
     args = parser.parse_args(argv)
     try:
+        if args.setup:
+            setup_runtime()
+            return 0
+        python = environment_python()
+        if args.start and python.is_file() and Path(sys.prefix).resolve() != python.parent.parent.resolve():
+            subprocess.run([str(python), "-m", "sservcli.windows_launcher", *(argv if argv is not None else sys.argv[1:])],
+                           cwd=Path(__file__).resolve().parents[1], check=True)
+            return 0
         check_runtime()
         if not args.start:
-            print("Ready. Python, Tkinter, and OpenSSH are available. Run Start.cmd; compilation is not required.")
+            print("Ready. Python, Tkinter, and the SSH library are available. Run Start.cmd; native compilation is not required.")
             return 0
         from .instance import state_directory
         executable = Path(sys.executable)

@@ -28,11 +28,12 @@ class BundleTests(unittest.TestCase):
         self.temp = tempfile.TemporaryDirectory()
         self.addCleanup(self.temp.cleanup)
         self.directory = Path(self.temp.name)
-        self.config = json.loads((ROOT / "client/examples/services.json").read_text())
+        self.config = json.loads((ROOT / "examples/services.json").read_text())
         self.config["ssh"].update({"host": "192.0.2.10", "fallback_hosts": ["192.0.2.11"], "port": 2222, "user": "bundle_test", "identity_file": None})
         self.config_path = self.directory / "services.json"
         self.config_path.write_text(json.dumps(self.config))
         self.args = bundle.parser().parse_args([
+            "--legacy-ssh",
             "--config", str(self.config_path),
             "--public-key", str(self.key_dir / "client.pub"),
             "--host-key", str(self.key_dir / "host.pub"),
@@ -71,7 +72,7 @@ class BundleTests(unittest.TestCase):
             self.assertIn("Build.cmd", archive.namelist())
             self.assertIn(b"sservcli.windows_launcher --check", archive.read("Build.cmd"))
             self.assertNotIn(b"cargo", archive.read("Build.cmd"))
-            for name in ["sservcli/__main__.py", "sservcli/config.py", "sservcli/tunnel.py", "sservcli/desktop.py", "sservcli/windows.py", "client/examples/services.windows.json"]:
+            for name in ["sservcli/__main__.py", "sservcli/config.py", "sservcli/tunnel.py", "sservcli/desktop.py", "sservcli/windows.py", "examples/services.windows.json"]:
                 self.assertIn(name, archive.namelist())
             self.assertNotIn("sservcli-desktop.exe", archive.namelist())
             self.assertIn("SHA256SUMS.txt", archive.namelist())
@@ -197,6 +198,69 @@ class BundleTests(unittest.TestCase):
             else: config["ssh"]["typo"] = "ignored"
             with self.subTest(mutation=mutation), self.assertRaises(bundle.BundleError):
                 bundle.validate_profile(config)
+
+
+class TokenBundleTests(unittest.TestCase):
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp.cleanup)
+        self.directory = Path(self.temp.name)
+        self.config = json.loads((ROOT / "examples/services.token.json").read_text())
+        self.config["ssh"].update(host="192.0.2.10", fallback_hosts=["192.0.2.11"])
+        self.path = self.directory / "services.json"
+        self.path.write_text(json.dumps(self.config))
+        self.args = bundle.parser().parse_args(["--config", str(self.path), "--state-dir", str(self.directory / "server-state"),
+                                              "--output", str(self.directory / "client.zip")])
+
+    def test_token_bundle_needs_no_login_public_key_or_account_operations_and_never_copies_tokens(self):
+        from sservcli.token_auth import private_directory, read_private, write_private
+        private_directory(self.args.state_dir)
+        secret = "aB3dE5gH"
+        write_private(self.args.state_dir / "access.token", secret + "\n")
+        self.args.public_key = self.directory / "missing-client.pub"
+        with patch.object(bundle, "run", side_effect=AssertionError("No account or OpenSSH operation expected")):
+            first = bundle.package(self.args)
+            again = bundle.package(self.args)
+        self.assertEqual(again.name, "client-2.zip")
+        self.assertEqual(read_private(self.args.state_dir / "access.token").strip(), secret)
+        with zipfile.ZipFile(first) as archive, zipfile.ZipFile(again) as second:
+            profile = json.loads(archive.read("services.json"))
+            self.assertEqual(profile["version"], 2)
+            self.assertNotIn("user", profile["ssh"])
+            self.assertNotIn("identity_file", profile["ssh"])
+            self.assertEqual(profile["ssh"]["host"], "192.0.2.10")
+            self.assertEqual(profile["ssh"]["fallback_hosts"], ["192.0.2.11"])
+            self.assertEqual(profile["ssh"]["host_public_key"], json.loads(second.read("services.json"))["ssh"]["host_public_key"])
+            self.assertIn("requirements.txt", archive.namelist())
+            self.assertIn("sservcli/token_tunnel.py", archive.namelist())
+            self.assertIn(b"--only-binary=:all:", archive.read("sservcli/windows_launcher.py"))
+            for name in archive.namelist():
+                self.assertNotIn(secret.encode(), archive.read(name))
+                self.assertNotIn(b"BEGIN OPENSSH PRIVATE KEY", archive.read(name))
+                self.assertFalse(name.startswith(("var/", ".venv/")))
+
+    def test_token_bundle_prepares_only_host_identity_and_does_not_issue_a_token(self):
+        bundle.package(self.args)
+        self.assertTrue((self.args.state_dir / "host_ed25519").is_file())
+        self.assertFalse((self.args.state_dir / "access.token").exists())
+
+    def test_legacy_input_can_be_upgraded_to_token_mode_without_creating_a_user(self):
+        legacy = json.loads((ROOT / "examples/services.json").read_text())
+        legacy["ssh"]["host"] = "192.0.2.10"
+        self.path.write_text(json.dumps(legacy))
+        with patch.object(bundle, "run", side_effect=AssertionError("Must not provision an OS account")):
+            output = bundle.package(self.args)
+        with zipfile.ZipFile(output) as archive:
+            ssh = json.loads(archive.read("services.json"))["ssh"]
+            self.assertEqual(ssh["port"], 8022)
+            self.assertNotIn("user", ssh)
+            self.assertNotIn("identity_file", ssh)
+
+    def test_token_dry_run_does_not_create_state_keys_token_or_zip(self):
+        self.args.dry_run = True
+        bundle.package(self.args)
+        self.assertFalse(self.args.state_dir.exists())
+        self.assertFalse(self.args.output.exists())
 
 
 if __name__ == "__main__":

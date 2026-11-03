@@ -18,10 +18,13 @@ import zipfile
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
-from sservcli.config import ConfigError, load_profile, validate_profile
-spec = importlib.util.spec_from_file_location("sservcli_server", ROOT / "server/sservcli_server.py")
-server = importlib.util.module_from_spec(spec)
-spec.loader.exec_module(server)
+from sservcli.config import ConfigError, load_profile, token_profile, validate_profile
+server = None
+if os.name == "posix":
+    spec = importlib.util.spec_from_file_location("sservcli_server", ROOT / "server/sservcli_server.py")
+    server = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(server)
+LegacySetupError = server.SetupError if server else ConfigError
 
 
 BundleError = ConfigError
@@ -36,9 +39,11 @@ def run(argv, *, timeout=3600):
 
 def source_files(root=ROOT):
     """Explicit runtime allowlist: never walk arbitrary directories or key files."""
-    required = ["Build.cmd", "Start.cmd", "README.md", "client/examples/services.json", "client/examples/services.windows.json"]
+    required = ["Build.cmd", "Start.cmd", "README.md", "requirements.txt", "examples/services.json", "examples/services.windows.json",
+                "examples/services.token.json", "examples/services.token.windows.json"]
     required += [f"sservcli/{name}.py" for name in (
-        "__init__", "__main__", "config", "tunnel", "desktop", "instance", "windows", "windows_launcher")]
+        "__init__", "__main__", "config", "tunnel", "desktop", "instance", "windows", "windows_launcher",
+        "token_auth", "token_server", "token_tunnel", "relay")]
     files = {}
     for name in required:
         path = root / name
@@ -78,13 +83,14 @@ def client_archive(config, inputs):
     files = {**inputs, "services.json": (json.dumps(config, indent=2) + "\n").encode(),
              "README.txt": ("sservcli Python Windows client\r\n\r\n"
                 "Extract the entire ZIP under your Windows user account.\r\n"
-                "Install Python 3.11+ with Tcl/Tk and the Python launcher, and enable Windows OpenSSH Client.\r\n"
-                "Run Start.cmd. Build.cmd only checks prerequisites; compilation and pip install are not required.\r\n"
-                "Use the private key or SSH Agent matching the client public key authorized on the server.\r\n"
+                "Install Python 3.11+ with Tcl/Tk and the Python launcher.\r\n"
+                "Run Build.cmd once to install Python SSH dependencies from binary wheels, then run Start.cmd.\r\n"
+                + ("Enter the current case-sensitive 8-character token shown by make server. It is not included in this ZIP.\r\n" if config["version"] == 2 else
+                   "This is a legacy SSH-key profile: enable OpenSSH Client and use the authorized private key/Agent.\r\n") +
                 "All enabled services connect automatically. Click the tray icon to show services. Tray > Quit stops SSH.\r\n"
                 "Closing the window keeps forwarding in the Windows tray; on other platforms it minimizes the window.\r\n"
-                "services.json supplies the host key, fallback addresses, services, and client identity path.\r\n"
-                "No private keys or passwords are included. See README.md for configuration and troubleshooting.\r\n").encode()}
+                "services.json supplies the host key, fallback addresses, and services.\r\n"
+                "No private keys or shared tokens are included. See README.md for configuration and troubleshooting.\r\n").encode()}
     if config["ssh"].get("host_public_key"):
         files["server-host-key.pub"] = (config["ssh"]["host_public_key"].strip() + "\n").encode()
     return files
@@ -122,7 +128,11 @@ def profile_for(args):
 
 def package(args):
     if not args.config.is_file():
-        raise BundleError("Set CONFIG to an existing services JSON (copy and edit client/examples/services.json)")
+        raise BundleError("Set CONFIG to an existing services JSON (copy and edit examples/services.json)")
+    if not args.client_only and not args.legacy_ssh:
+        return package_token(args)
+    if args.legacy_ssh and server is None:
+        raise BundleError("Legacy account provisioning requires Ubuntu; token mode does not require OS accounts")
     if not args.client_only and (not args.public_key or not args.public_key.is_file()):
         raise BundleError("Set PUBKEY_FILE to the existing Windows client's Ed25519 PUBLIC key; private keys are never packaged")
     if args.client_only:
@@ -185,6 +195,29 @@ def package(args):
     return output
 
 
+def package_token(args):
+    config = token_profile(load_profile(args.config), args.token_port)
+    if config["ssh"]["host"] == "server.example.com":
+        raise BundleError("Set ssh.host in CONFIG to the server's reachable IP or hostname")
+    inputs = source_files()
+    output = (args.output or ROOT / "dist/sservcli-windows-token.zip").absolute()
+    if args.dry_run:
+        print("Dry run: token-server client inputs validated. Would prepare the persistent server host identity in", args.state_dir)
+        print("Would publish:", output, "(numeric suffix if it exists). No account, key registration, or shared token is needed for packaging.")
+        return None
+    try:
+        from sservcli.token_auth import host_identity
+        _, public = host_identity(args.state_dir)
+    except ImportError as error:
+        raise BundleError("Run make setup to install Python SSH dependencies") from error
+    config["ssh"]["host_public_key"] = public
+    output.parent.mkdir(parents=True, exist_ok=True)
+    with tempfile.TemporaryDirectory(prefix=".sservcli-token-bundle-", dir=output.parent) as directory:
+        output = write_archive(output, client_archive(config, inputs), directory)
+    print(f"Token client ZIP ready: {output}\nRun Build.cmd once, then Start.cmd on Windows. Enter the 8-character token printed by make server. The token was not packaged.")
+    return output
+
+
 def parser():
     result = argparse.ArgumentParser(description=__doc__)
     env = os.environ
@@ -193,6 +226,9 @@ def parser():
     result.add_argument("--public-key", type=Path, default=Path(env["PUBKEY_FILE"]) if env.get("PUBKEY_FILE") else None)
     result.add_argument("--host-key", type=Path, default=Path(env.get("HOST_KEY_FILE") or "/etc/ssh/ssh_host_ed25519_key.pub"))
     result.add_argument("--client-only", action="store_true", help="Package an existing client profile without account changes or PUBKEY_FILE")
+    result.add_argument("--legacy-ssh", action="store_true", default=env.get("LEGACY_SSH") == "1", help="Use the old OS-account/public-key provisioning workflow")
+    result.add_argument("--state-dir", type=Path, default=Path(env.get("SERVER_STATE") or ROOT / "var/server"))
+    result.add_argument("--token-port", type=int, default=int(env["TOKEN_PORT"]) if env.get("TOKEN_PORT") else None)
     result.add_argument("--output", type=Path, default=Path(env["BUNDLE_OUTPUT"]) if env.get("BUNDLE_OUTPUT") else None)
     result.add_argument("--sshd-config", default=env.get("SSHD_CONFIG", "/etc/ssh/sshd_config"))
     result.add_argument("--ssh-service", default=env.get("SSH_SERVICE", "ssh"))
@@ -203,6 +239,6 @@ def parser():
 if __name__ == "__main__":
     try:
         package(parser().parse_args())
-    except (BundleError, server.SetupError, OSError, ValueError, KeyError, TypeError, subprocess.TimeoutExpired, zipfile.BadZipFile) as error:
+    except (BundleError, LegacySetupError, OSError, ValueError, KeyError, TypeError, subprocess.TimeoutExpired, zipfile.BadZipFile) as error:
         print(f"sservcli-bundle: {error}", file=sys.stderr)
         sys.exit(1)

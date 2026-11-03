@@ -27,6 +27,12 @@ class TcpTableTests(unittest.TestCase):
 
 @unittest.skipUnless(os.name == "nt", "Native Windows API tests")
 class NativeWindowsTests(unittest.TestCase):
+    def test_remembered_token_uses_current_user_data_protection(self):
+        from sservcli.windows import protect_secret, unprotect_secret
+        protected = protect_secret("aB3dE5gH")
+        self.assertNotIn("aB3dE5gH", protected)
+        self.assertEqual(unprotect_secret(protected), "aB3dE5gH")
+
     def test_tcp_listener_ownership_uses_the_real_process_table(self):
         from sservcli.windows import listeners_owned_by
         with socket.socket() as listener:

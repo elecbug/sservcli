@@ -10,6 +10,43 @@ HANDLE = C.c_void_p
 SIZE_T = C.c_size_t
 
 
+class DataBlob(C.Structure):
+    _fields_ = [("size", DWORD), ("data", C.POINTER(C.c_ubyte))]
+
+
+def _secret_blob(data):
+    buffer = (C.c_ubyte * len(data)).from_buffer_copy(data)
+    return DataBlob(len(data), buffer), buffer
+
+
+def protect_secret(text):
+    import base64
+    source, buffer = _secret_blob(text.encode("utf-8"))
+    destination = DataBlob()
+    protect = api("crypt32", "CryptProtectData", C.c_int,
+                  [C.POINTER(DataBlob), C.c_wchar_p, C.POINTER(DataBlob), HANDLE, HANDLE, DWORD, C.POINTER(DataBlob)])
+    if not protect(C.byref(source), "sservcli shared token", None, None, None, 1, C.byref(destination)):
+        raise C.WinError(C.get_last_error())
+    try:
+        return base64.b64encode(C.string_at(destination.data, destination.size)).decode("ascii")
+    finally:
+        api("kernel32", "LocalFree", HANDLE, [HANDLE])(C.cast(destination.data, HANDLE))
+
+
+def unprotect_secret(text):
+    import base64
+    source, buffer = _secret_blob(base64.b64decode(text, validate=True))
+    destination = DataBlob()
+    unprotect = api("crypt32", "CryptUnprotectData", C.c_int,
+                    [C.POINTER(DataBlob), HANDLE, C.POINTER(DataBlob), HANDLE, HANDLE, DWORD, C.POINTER(DataBlob)])
+    if not unprotect(C.byref(source), None, None, None, None, 1, C.byref(destination)):
+        raise C.WinError(C.get_last_error())
+    try:
+        return C.string_at(destination.data, destination.size).decode("utf-8")
+    finally:
+        api("kernel32", "LocalFree", HANDLE, [HANDLE])(C.cast(destination.data, HANDLE))
+
+
 def api(library, name, result, arguments):
     if os.name != "nt":
         raise OSError("This operation requires Windows")

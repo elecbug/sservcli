@@ -10,12 +10,13 @@ from tkinter import filedialog, messagebox, ttk
 from .config import ConfigError, endpoint, load_profile, resolved_profile, save_profile, service_url, validate_profile
 from .instance import Instance, state_directory
 from .tunnel import Tunnel, launch_service
+from .token_auth import remembered_token, store_token
 
 
 def quick_profile(host, fallback, port, user, identity, host_key, services):
-    config = {"version": 1, "name": host.strip() or "My server", "ssh": {
+    config = {"version": 2, "name": host.strip() or "My server", "ssh": {
         "host": host.strip(), "fallback_hosts": json.loads(fallback or "[]"), "port": int(port),
-        "user": user.strip(), "identity_file": identity.strip() or None, "host_public_key": host_key.strip()},
+        "host_public_key": host_key.strip()},
         "reconnect": {"enabled": True, "max_attempts": 5, "initial_delay_secs": 2, "max_delay_secs": 30},
         "services": services}
     validate_profile(config)
@@ -83,6 +84,15 @@ class Desktop:
         self.profile_label = tk.StringVar(value="No profile selected")
         ttk.Label(shell, textvariable=self.profile_label).pack(anchor="w")
         ttk.Label(shell, textvariable=self.status, wraplength=900).pack(anchor="w", pady=(4, 10))
+        self.token_frame = ttk.Frame(shell)
+        self.token_frame.pack(fill="x", pady=(0, 10))
+        ttk.Label(self.token_frame, text="Shared token (8 characters, case-sensitive)").pack(side="left")
+        self.token = tk.StringVar()
+        self.token_entry = ttk.Entry(self.token_frame, textvariable=self.token, show="*", width=14)
+        self.token_entry.pack(side="left", padx=8)
+        self.token_entry.bind("<Return>", lambda _: self.connect())
+        self.keep_token = tk.BooleanVar(value=True)
+        ttk.Checkbutton(self.token_frame, text="Remember on this device", variable=self.keep_token, command=self.forget_token).pack(side="left")
         self.tabs = ttk.Notebook(shell)
         self.tabs.pack(fill="both", expand=True)
         catalog = ttk.Frame(self.tabs, padding=10)
@@ -117,17 +127,27 @@ class Desktop:
         setup.columnconfigure(1, weight=1)
         self.fields = {}
         specifications = (("host", "Server IP / hostname", ""), ("fallback", "Alternative IPs (JSON array)", "[]"),
-                          ("port", "SSH port", "22"), ("user", "SSH user", "svc_tunnel"),
+                          ("port", "SSH port", "8022"), ("user", "SSH user", "svc_tunnel"),
                           ("identity", "Private key (blank = SSH Agent)", ""))
+        self.legacy_widgets = []
         for row, (name, label, default) in enumerate(specifications):
-            ttk.Label(setup, text=label).grid(row=row, column=0, sticky="w", padx=(0, 10), pady=4)
+            label_widget = ttk.Label(setup, text=label)
+            label_widget.grid(row=row, column=0, sticky="w", padx=(0, 10), pady=4)
             self.fields[name] = tk.StringVar(value=default)
-            ttk.Entry(setup, textvariable=self.fields[name]).grid(row=row, column=1, sticky="ew", pady=4)
-        ttk.Button(setup, text="Browse", command=self.choose_identity).grid(row=4, column=2, padx=4)
+            entry = ttk.Entry(setup, textvariable=self.fields[name])
+            entry.grid(row=row, column=1, sticky="ew", pady=4)
+            if name in ("user", "identity"):
+                self.legacy_widgets.extend((label_widget, entry))
+        browse = ttk.Button(setup, text="Browse", command=self.choose_identity)
+        browse.grid(row=4, column=2, padx=4)
+        self.legacy_widgets.append(browse)
+        for widget in self.legacy_widgets:
+            widget.grid_remove()
         ttk.Label(setup, text="Server host public key").grid(row=5, column=0, sticky="nw", pady=4)
         self.host_key = tk.Text(setup, height=3, wrap="word")
         self.host_key.grid(row=5, column=1, columnspan=2, sticky="ew", pady=4)
-        ttk.Label(setup, text="Paste the server's ssh_host_ed25519_key.pub. Login uses your existing private key or Agent.", wraplength=640).grid(row=6, column=1, columnspan=2, sticky="w", pady=4)
+        self.key_help = tk.StringVar(value="The server bundle includes this public key. Login uses the startup token entered above.")
+        ttk.Label(setup, textvariable=self.key_help, wraplength=640).grid(row=6, column=1, columnspan=2, sticky="w", pady=4)
         service_fields = ttk.Frame(setup)
         service_fields.grid(row=7, column=0, columnspan=3, sticky="ew", pady=10)
         self.quick_services = []
@@ -168,8 +188,18 @@ class Desktop:
         self.editor.delete("1.0", "end")
         self.editor.insert("1.0", json.dumps(config, indent=2, ensure_ascii=False))
         ssh = config["ssh"]
+        if config["version"] == 2:
+            self.token_frame.pack(fill="x", pady=(0, 10), before=self.tabs)
+            self.token.set(remembered_token(self.directory, config) or "")
+            self.key_help.set("The server bundle includes this public key. Login uses the startup token entered above.")
+        else:
+            self.token_frame.pack_forget()
+            self.token.set("")
+            self.key_help.set("Login uses your existing SSH private key or Agent.")
+        for widget in self.legacy_widgets:
+            widget.grid() if config["version"] == 1 else widget.grid_remove()
         for field, value in (("host", ssh["host"]), ("fallback", json.dumps(ssh.get("fallback_hosts", []))),
-                             ("port", ssh.get("port", 22)), ("user", ssh["user"]), ("identity", ssh.get("identity_file") or "")):
+                             ("port", ssh.get("port", 8022 if config["version"] == 2 else 22)), ("user", ssh.get("user", "sservcli")), ("identity", ssh.get("identity_file") or "")):
             self.fields[field].set(value)
         self.host_key.delete("1.0", "end")
         self.host_key.insert("1.0", ssh.get("host_public_key", ""))
@@ -189,8 +219,13 @@ class Desktop:
         self.disconnect()
         self.config = self.config_path = None
         self.profile_label.set("New connection")
-        for name, value in (("host", ""), ("fallback", "[]"), ("port", "22"), ("user", "svc_tunnel"), ("identity", "")):
+        for name, value in (("host", ""), ("fallback", "[]"), ("port", "8022"), ("user", "svc_tunnel"), ("identity", "")):
             self.fields[name].set(value)
+        self.token.set("")
+        self.key_help.set("The server bundle includes this public key. Login uses the startup token entered above.")
+        self.token_frame.pack(fill="x", pady=(0, 10), before=self.tabs)
+        for widget in self.legacy_widgets:
+            widget.grid_remove()
         self.host_key.delete("1.0", "end")
         self.editor.delete("1.0", "end")
         for index, (remote_port, local_port) in enumerate(((8080, 18080), (5432, 15432), (9000, 19000))):
@@ -232,8 +267,9 @@ class Desktop:
                 config = copy.deepcopy(self.config)
                 ssh = config["ssh"]
                 ssh.update(host=self.fields["host"].get().strip(), fallback_hosts=json.loads(self.fields["fallback"].get()),
-                           port=int(self.fields["port"].get()), user=self.fields["user"].get().strip(),
-                           identity_file=self.fields["identity"].get().strip() or None)
+                           port=int(self.fields["port"].get()))
+                if config["version"] == 1:
+                    ssh.update(user=self.fields["user"].get().strip(), identity_file=self.fields["identity"].get().strip() or None)
                 key = self.host_key.get("1.0", "end").strip()
                 if key:
                     ssh.pop("known_hosts_file", None)
@@ -257,8 +293,21 @@ class Desktop:
                 raise ConfigError("Open a profile or create a connection first")
             if self.tunnel.snapshot()["status"] in ("connecting", "connected", "reconnecting"):
                 return
-            self.tunnel.connect(resolved_profile(self.config, self.config_path))
+            if self.config["version"] == 2:
+                token = self.token.get().strip()
+                if not token:
+                    self.show()
+                    self.token_entry.focus_set()
+                    self.status.set("Enter the current 8-character token shown by the server, then click Connect.")
+                    return
+                self.tunnel.connect(resolved_profile(self.config, self.config_path), token=token)
+            else:
+                self.tunnel.connect(resolved_profile(self.config, self.config_path))
         self.perform(start)
+
+    def forget_token(self):
+        if self.config and self.config["version"] == 2 and not self.keep_token.get():
+            self.perform(lambda: store_token(self.directory, self.config, None))
 
     def disconnect(self):
         self.tunnel.disconnect()
@@ -323,7 +372,18 @@ class Desktop:
             except queue.Empty:
                 break
             self.status.set(f"{status}: {message}")
+            if status == "connected" and self.config and self.config["version"] == 2:
+                try:
+                    store_token(self.directory, self.config, self.token.get().strip() if self.keep_token.get() else None)
+                except (OSError, ValueError):
+                    self.status.set("Connected. The token could not be remembered on this device.")
             if status == "failed":
+                if self.config and self.config["version"] == 2 and "Shared token rejected" in message:
+                    self.token.set("")
+                    try:
+                        store_token(self.directory, self.config, None)
+                    except (OSError, ValueError):
+                        pass
                 self.show()
             changed = True
         if changed:

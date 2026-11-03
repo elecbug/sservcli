@@ -1,110 +1,73 @@
 # sservcli
 
-Use several services on one server through a single verified SSH connection. The client starts every enabled forward automatically and lists the local addresses in a desktop window. On Windows it runs in the notification area; closing the window keeps the forwards running.
+Access several services on one server through one encrypted SSH connection. Start the Python server, share its **8-character startup token**, and enter that token in the Windows client. All enabled services forward automatically; the desktop lists their local addresses and runs in the Windows notification area.
 
-The entire application uses **Python 3.11+ and its standard library**. The desktop uses Tkinter; Windows integration uses `ctypes`. There are no pip dependencies. OpenSSH supplies the transport. The Ubuntu server uses its existing `sshd`; no application daemon runs on the server.
+The application uses Python 3.11+, Tkinter, and [Paramiko](https://www.paramiko.org/). Both the token server and client are Python programs. Token mode needs no OS account creation, client private keys, SSH Agent, system `sshd`, Rust, Node.js, or native compilation. The older OpenSSH public-key workflow remains available explicitly.
 
-## Requirements
+## Quick start
 
-| System | Requirements |
-| --- | --- |
-| Ubuntu server | Python 3.11+, OpenSSH server/client, GNU Make; sudo for account provisioning |
-| Windows client | Windows 10/11, Python 3.11+ with Tcl/Tk and the Python launcher, Windows OpenSSH Client |
-| Linux/macOS desktop | Python 3.11+, working Tkinter, OpenSSH Client, a graphical session |
-
-Install Python on Windows from [python.org](https://www.python.org/downloads/windows/), with Tcl/Tk enabled. The embeddable distribution does not include Tkinter. Enable **OpenSSH Client** in Windows Optional Features. `python -m tkinter` verifies the GUI installation. See the [Tkinter documentation](https://docs.python.org/3/library/tkinter.html) and [Python on Windows](https://docs.python.org/3/using/windows.html).
-
-On Ubuntu 24.04:
+On the server, install Python 3.11+, its venv support, and Make. For Ubuntu 24.04:
 
 ```sh
 sudo apt-get update
-sudo apt-get install -y python3 openssh-server make
+sudo apt-get install -y python3 python3-venv make
 ```
 
-For the Linux GUI, also install `python3-tk`. Server provisioning and ZIP generation do not import Tkinter.
-
-## Prepare the server and Windows ZIP
-
-Use your existing SSH private key or SSH Agent on Windows. If you need a new client key, generate it **on Windows**, for example in PowerShell:
-
-```powershell
-ssh-keygen -t ed25519 -f "$env:USERPROFILE/.ssh/sservcli"
-```
-
-Transfer only `sservcli.pub` to the server administrator. Keep the private `sservcli` file on Windows. `PUBKEY_FILE` is the **client login public key**, separate from the server host key.
-
-On the server, copy the example and edit it:
+Copy an example and edit the reachable server address, optional fallback addresses, and service ports:
 
 ```sh
-cp client/examples/services.windows.json services.json
+cp examples/services.token.windows.json services.json
+# Edit ssh.host, ssh.fallback_hosts, and services.
+make server CONFIG=services.json
 ```
 
-Set `ssh.host` to the reachable server IP/hostname, `ssh.user` to the dedicated account to create or reuse, and `ssh.fallback_hosts` to an ordered array of alternative addresses. Adjust the service ports. Set `ssh.identity_file` to your existing private key's Windows path, such as `~/.ssh/sservcli`, or `null` for Agent/default identities. `CONFIG` describes the Windows client, so this path need not exist on the server.
-
-Preview, then provision and package:
+`make server` installs the pinned Python dependencies into `.venv` on first use, creates/preserves the server's host identity under `var/server`, and listens on port **8022**. It displays a new token on an interactive terminal. The token is also written to the private file:
 
 ```sh
-make bundle PUBKEY_FILE=/path/to/sservcli.pub CONFIG=services.json DRY_RUN=1
-make bundle PUBKEY_FILE=/path/to/sservcli.pub CONFIG=services.json
+cat var/server/access.token
 ```
 
-The command validates the settings and Python files, generates missing server host keys, enables/starts SSH, creates or reuses the account, and produces:
-
-```text
-dist/sservcli-windows-<ssh.user>-python.zip
-```
-
-The packaged profile pins the actual server public host key. The ZIP contains the Python client, `Start.cmd`, `Build.cmd`, examples, documentation, and `SHA256SUMS.txt`. Private keys are never copied. Packaging is local and requires no GitHub, `gh`, Rust, Node.js, or Windows build host. Sudo is needed only for provisioning.
-
-Repeating the same `make bundle` command is supported:
-
-- If the account is missing, the helper creates it and registers the public key.
-- If sservcli already manages the account, it verifies the existing identity/policy and reuses it. A new public key is appended while other keys are preserved. An already registered key is matched by key type and blob, regardless of its comment, and is not duplicated.
-- New service destinations extend the managed allowlist. Previously allowed destinations remain available to existing keys. The matching sservcli key entry gains the new destinations; other keys retain their own restrictions. Administrator-supplied key options are preserved. `audit --config` checks the recorded full policy, including retained destinations.
-- If the account exists without sservcli metadata, account creation and key/policy changes are skipped and packaging continues. The command prints that it reused an external account. That account's existing SSH setup must already authorize the selected key and allow the configured forwarding destinations; its permissions stay under the administrator's control.
-- If a ZIP already exists, the next archive is saved as `...-2.zip`, `...-3.zip`, and so on. Earlier downloads are preserved.
-
-A packaging failure after successful account creation attempts to remove only that newly created account. Reused or external accounts are never removed by bundle cleanup; completed key registrations on reused accounts remain if a later packaging step fails. Invalid keys, unsafe filesystem paths, altered managed metadata, and SSH configuration errors still report a real error. An orphaned home without a corresponding account is not adopted automatically.
-
-Download with your normal administrator account, extract the **entire ZIP** under your Windows user account, and double-click **Start.cmd**. The forwarding account cannot use SFTP/SCP. Every enabled service connects automatically. Click the tray icon to show the service list; use tray **Quit** to stop forwarding. `Build.cmd` checks prerequisites and does not compile anything.
-
-| Optional input | Purpose |
-| --- | --- |
-| `BUNDLE_OUTPUT` | Output ZIP path; a numeric suffix is added if it already exists |
-| `HOST_KEY_FILE` | Server host public key; default `/etc/ssh/ssh_host_ed25519_key.pub` |
-| `SSHD_CONFIG` / `SSH_SERVICE` | SSH config/service; defaults `/etc/ssh/sshd_config` / `ssh` |
-| `DRY_RUN=1` | Validate without changing accounts or publishing a ZIP |
-| `PYTHON` | Make's Python executable; default `python3` |
-
-`CONFIG` defaults to `services.json`. `PUBKEY_FILE` is required for `bundle` and must contain one plain Ed25519 public key.
-
-## Updating an existing installation
-
-Existing version 1 profiles work with the Python client. For an already provisioned account, use the final `services.json` from the previous ZIP, including its pinned `host_public_key`:
+Keep that server process running. In another terminal, create the Windows ZIP:
 
 ```sh
-make client-zip CONFIG=/path/to/existing/services.json BUNDLE_OUTPUT=dist/sservcli-python-update.zip
+make bundle CONFIG=services.json
 ```
 
-This packages the client without server account changes or `PUBKEY_FILE`. Extract into a new folder and run `Start.cmd`. Keep your existing private key/Agent and stop the old client first to release its local ports.
+The output is `dist/sservcli-windows-token.zip`. Existing archives receive numeric suffixes such as `-2.zip`; earlier downloads are preserved. Packaging prepares the same persistent server host identity if needed, so it can also run before the server. Packaging does **not** issue a token or include one in the ZIP. `PUBKEY_FILE` is not needed in token mode.
 
-The Rust/Tauri client has been replaced. Previously downloaded ZIPs still contain the old `Build.cmd`; extract the **new Python ZIP** to use the new implementation. Updating the server checkout does not update files already downloaded to Windows. The new script never invokes Cargo, so the former `edition2024` error no longer applies. Python must be installed on Windows: this ZIP does not bundle a Python runtime or standalone executable.
+On Windows:
+
+1. Install Python 3.11+ with Tcl/Tk and the Python launcher from [python.org](https://www.python.org/downloads/windows/).
+2. Extract the entire ZIP into a folder under your Windows account.
+3. Run **Build.cmd** once to create `.venv` and install the pinned SSH dependencies. Internet access is needed for this first installation. Only binary wheels are accepted; no compiler is invoked.
+4. Run **Start.cmd**, enter the token shown by the server, and click **Connect**.
+
+The client authenticates once and forwards all enabled services. Click the tray icon to view services or copy an endpoint. Closing the window keeps forwarding; tray **Quit** disconnects and exits. The server's configured port must be reachable through your firewall. Your actual web/DB/API services should listen on server loopback and retain their own authentication.
+
+## Token behavior
+
+- Every token is exactly **8 characters**, chosen with Python's `secrets` module from `A–Z`, `a–z`, and `0–9`: 62 possible characters per position.
+- Authentication is case-sensitive. The token is sent only inside an encrypted SSH connection, after the client verifies the pinned server public key included in the ZIP.
+- Each successful server start generates a fresh token. Stopping/restarting the server closes existing connections and invalidates the previous token. Share the new token with clients after a restart; the persistent server key means they do not need a new ZIP for token rotation alone.
+- Five failed attempts from one source IP within 60 seconds temporarily block that source. A global limit of 50 failures within 60 seconds also applies. After repeated mistakes, wait 60 seconds before trying again. Clients sharing a public IP share its limit.
+- Shell, command execution, SFTP, remote forwarding, agent/X11 forwarding, and unknown channel types are denied. Only configured `127.0.0.1:<remote_port>` destinations are allowed. A shared token grants access to that server's configured destinations; it is not a per-user permission system.
+- Tokens are excluded from ZIPs and profile JSON. Client diagnostic logs never print them. The server prints its token only to an interactive terminal; when stdout is redirected, read the private token file instead of searching logs.
+- **Remember on this device** saves a successfully authenticated token separately from the profile. Windows uses current-user [DPAPI protection](https://learn.microsoft.com/en-us/windows/win32/api/dpapi/nf-dpapi-cryptprotectdata); Unix stores it in a private directory/file. Unchecking the option forgets the saved token. A rejected saved token is cleared so the new startup token can be entered.
+
+The server uses SSH's encrypted password-authentication exchange for this application token. It does not enable password login in the machine's OpenSSH configuration or modify any OS user.
 
 ## Configuration
 
-All local listeners and remote destinations use loopback:
+The token server/client uses profile version 2:
 
 ```json
 {
-  "version": 1,
+  "version": 2,
   "name": "My server",
   "ssh": {
     "host": "203.0.113.10",
     "fallback_hosts": ["198.51.100.20", "server.example.net"],
-    "port": 22,
-    "user": "svc_tunnel",
-    "identity_file": "~/.ssh/sservcli",
-    "host_public_key": "ssh-ed25519 REPLACE_WITH_THE_REAL_SERVER_HOST_PUBLIC_KEY"
+    "port": 8022
   },
   "reconnect": {
     "enabled": true,
@@ -137,98 +100,90 @@ All local listeners and remote destinations use loopback:
 }
 ```
 
-Replace documentation addresses and the host-key placeholder before connecting.
+The addresses above are documentation examples. Use your actual reachable address. `make bundle` adds `ssh.host_public_key` from the server's persistent identity to the client's profile. A client refuses to send its token without a pinned key, and it stops immediately on a mismatch. Obtain bundles/public keys through a trusted administrator channel.
 
-- The primary address is tried first, then alternatives in order. At most 16 unique addresses are allowed. They must reach the **same host key**. Host verification/authentication failures stop the connection; fallbacks cannot bypass them.
-- After an established connection drops, recovery starts with the next address. Reconnection uses bounded exponential delays and at most `max_attempts` recovery cycles across the session. Initial connection failure exhausts the address list once and stops.
-- All enabled services share one SSH process. Set `enabled: false` to skip a service. At least one must be enabled to connect.
-- Configure 1–64 services with unique IDs and local ports. Local ports must be 1024–65535 and remote ports 1–65535. `remote_host` must be `127.0.0.1`.
-- `kind` is `web`, `api`, `database`, or `tcp`. Web/API services open in the default browser. `scheme` defaults to `http` and may be `https`; `path` defaults to `/`.
-- `launch` is an executable/argument array supporting `{host}`, `{port}`, and `{url}`. It runs without a shell. GUI users should launch command-line tools through a terminal, as in the PostgreSQL example. Alternatively, copy the endpoint into an external client.
-- Relative key/known-hosts paths resolve from the profile directory; `~` resolves to the client user's home. In JSON use `/` or doubled backslashes for Windows paths.
-- Set exactly one of `host_public_key` or `known_hosts_file`. Pinned keys apply to all addresses. An existing known-hosts file must already trust each address under the selected SSH port. Unknown keys are never accepted automatically.
-- `identity_file: null` uses Agent/default identities. An explicit key uses `IdentitiesOnly=yes`. For encrypted keys, load the key into SSH Agent beforehand; the background client never prompts for a passphrase.
-- Profiles are trusted local files because `launch` can run a program. Import only profiles you trust. SSH uses `-F none`, strict host verification, public-key authentication, and no shell interpolation.
+Alternative IPs/hostnames are tried in array order after the primary fails. They must reach the same server identity and port. Up to 16 unique addresses are supported. After an established transport drops, bounded reconnection starts with the next address. Initial connection failure tries the address list once; authentication and host-key failures stop immediately. Automatic reconnection uses the current token, so a server restart requires entering its new token.
 
-Services keep their own authentication and authorization. A ready listener confirms that SSH forwarding is available; it does not prove the remote application is healthy.
+Configure 1–64 services with unique IDs and local ports. Local ports must be 1024–65535; remote ports 1–65535. Every local listener and remote destination uses `127.0.0.1`. `enabled: false` is a client preference; the server allowlist includes all configured service destinations.
 
-## Desktop and CLI
+`kind` is `web`, `api`, `database`, or `tcp`. Web/API services open in the default browser; `scheme` defaults to `http` and may be `https`, while `path` defaults to `/`. An optional `launch` array names an executable and separate arguments, with `{host}`, `{port}`, and `{url}` placeholders. Command-line DB tools should be launched through a terminal, as in the Windows example. Launch arrays execute local programs, so import only profiles you trust. A ready listener indicates SSH forwarding is available; remote application health and service-level authentication remain separate.
 
-Run from the repository or extracted ZIP:
+## Commands and state
 
 ```sh
-python -m sservcli desktop --config services.json
-python -m sservcli check --config services.json
-python -m sservcli list --config services.json
-python -m sservcli connect --config services.json
-python -m sservcli connect --config services.json --open dashboard
+make setup
+make server CONFIG=services.json
+make bundle CONFIG=services.json
+make desktop CONFIG=/path/to/client-profile.json
+make client-zip CONFIG=/path/to/existing/client-profile.json
 ```
 
-Use `python3` where appropriate, or `py -3` on Windows. Ctrl+C stops the foreground client and releases its ports.
+`make client-zip` repackages an existing client profile without changing the server identity or provisioning anything. Use the generated client's profile, including its pinned public key. Both ZIP commands preserve earlier archives by adding numeric suffixes.
 
-The GUI provides a service catalog, local endpoint copying, connection setup, a full JSON editor, and logs. Opening a profile connects all enabled services. The last profile is remembered and connects when the program launches. Windows supports start-in-tray, show/connect/disconnect/quit, and one desktop instance per user. Starting a second instance shows the existing window. Linux/macOS minimize the window instead of using a native tray. The app does not install a Windows login task or OS service.
+| Make input | Purpose |
+| --- | --- |
+| `CONFIG` | Services JSON; default `services.json` |
+| `SERVER_STATE` | Private server identity/token directory; default `var/server`; use the same value for `server` and `bundle` |
+| `TOKEN_PORT` | Optional server/bundle port override; otherwise version 2 uses `ssh.port` or 8022 |
+| `LISTEN` | Server listening IP; default `0.0.0.0`; use `127.0.0.1` for a local-only server |
+| `BUNDLE_OUTPUT` | ZIP path; a numeric suffix is added if it exists |
+| `DRY_RUN=1` | Preview bundle inputs without creating identity, token, accounts, or ZIP; dependency setup may still run |
+| `PYTHON` / `VENV_DIR` | Bootstrap Python / Make's environment directory; defaults `python3` / `.venv` |
 
-`Start.cmd` uses `pythonw.exe` without a console. Windows preferences/startup logs live under `%LOCALAPPDATA%\sservcli`; Linux/macOS preferences use `$XDG_CONFIG_HOME/sservcli` or `~/.config/sservcli`. SSH logs are visible in the app.
+`SERVER_STATE/host_ed25519` is the private host key and must stay on the server. `host_ed25519.pub` is its public half. `access.token` contains only the current 8-character token. The directory and private files use modes 0700/0600 on Unix. Only one server process may use a state directory at a time; a duplicate launch cannot rotate the running server's token. Back up the host identity if clients should keep trusting the server after migration.
 
-For a quick initial profile using an administrator-supplied host public key:
+Run `server` and `bundle` as the same OS user. Token mode does not require sudo.
+
+For direct CLI use after setup:
 
 ```sh
-python -m sservcli init --host your-server.example --user existing-account \
-  --host-key server-host-key.pub --identity ~/.ssh/sservcli \
-  --fallback-hosts 192.0.2.20,192.0.2.21 --config services.json
+.venv/bin/python -m sservcli serve --config services.json --state-dir var/server
+.venv/bin/python -m sservcli check --config client-profile.json
+.venv/bin/python -m sservcli list --config client-profile.json
+.venv/bin/python -m sservcli connect --config client-profile.json
+.venv/bin/python -m sservcli connect --config client-profile.json --open dashboard
 ```
 
-`init` creates one web service, refuses to overwrite a file, and does not provision the server. Omitting `--identity` selects Agent/default identities. `command` prints the OpenSSH command for known-hosts profiles; pinned profiles use `connect`, which owns their temporary verification file and cleanup.
+Interactive `connect` prompts for the token without echo. Automation may read it with `--token-file /private/path/access.token` or `SSERVCLI_TOKEN`; tokens are not accepted as command-line arguments. Ctrl+C disconnects. `make server` stays in the foreground until stopped; it does not install a system service or automatically launch the underlying web/DB/API programs.
 
-## Server administration
+The desktop remembers its last profile and starts all enabled forwards when it launches and has a saved current token. Without a saved token it shows the input field. Windows supports start-in-tray, show/connect/disconnect/quit, and one instance per user; a second launch shows the existing window. Linux/macOS minimize the window instead of using a native tray. Launching the app does not install a login task.
 
-Generate missing server host keys and read the **public** key:
+Preferences, remembered tokens, and startup logs are under `%LOCALAPPDATA%\sservcli` on Windows, or `$XDG_CONFIG_HOME/sservcli` / `~/.config/sservcli` on Unix. Profiles contain service metadata and public server identity, not the shared token. `Start.cmd` uses `pythonw.exe` from the local environment to run without a console.
+
+## Existing SSH-key installations
+
+`examples/services.json` and `examples/services.windows.json` remain version 1 examples. Existing version 1 client profiles still use OpenSSH with the configured private key or Agent. New `make server`/`make bundle` runs can accept those files as inputs and convert them to token mode: OS user/private-key/known-hosts settings are removed, the token SSH port defaults to 8022, and the bundle uses the Python server's own persistent public key. Use `TOKEN_PORT` to select a different port.
+
+To keep the former OS-account/public-key provisioning workflow explicitly:
 
 ```sh
-sudo ssh-keygen -A
-cat /etc/ssh/ssh_host_ed25519_key.pub
+make bundle LEGACY_SSH=1 PUBKEY_FILE=/path/to/client.pub CONFIG=legacy-services.json
 ```
 
-Never distribute `/etc/ssh/ssh_host_ed25519_key`, which is private. Obtain/verify the public key through a trusted administrator channel; an unverified `ssh-keyscan` result does not establish trust. A server host key identifies the server and does not grant login access.
+Legacy provisioning requires Ubuntu/OpenSSH and sudo. Missing dedicated accounts are created. Existing sservcli-managed accounts are verified/reused, missing public keys are added, matching key identities are not duplicated, and old keys/destinations are preserved. External existing accounts skip account/key/policy changes and rely on their administrator-managed SSH setup. Existing accounts are never deleted by bundle cleanup; cleanup targets only an account created by that invocation. Genuine policy/metadata errors still report an error.
 
-Preview or manage only the SSH policy:
+The explicit administrator commands remain available:
 
 ```sh
-make render CONFIG=services.json
-sudo python3 server/sservcli_server.py install --config services.json \
-  --public-key /path/to/sservcli.pub --ensure-ssh
-sudo python3 server/sservcli_server.py audit --config services.json
+make render CONFIG=legacy-services.json
+sudo python3 server/sservcli_server.py install --config legacy-services.json --public-key /path/client.pub --ensure-ssh
+sudo python3 server/sservcli_server.py audit --config legacy-services.json
 sudo python3 server/sservcli_server.py remove --user svc_tunnel
 ```
 
-The helper validates SSH config before reload, audits effective restrictions, publishes credentials only after policy activation, and rolls back failed provisioning. Managed metadata lives in `/var/lib/sservcli`. Removal refuses unexpected edits and denies login before account cleanup. `install` remains a create-only administrator command; `bundle` uses the idempotent `ensure` command instead.
-
-The account requires public-key authentication, `MaxSessions 0`, local TCP forwarding, and an exact loopback `PermitOpen` allowlist. It denies shell/exec/SFTP, remote forwarding, agent/X11/socket forwarding, tunnels, and password/keyboard-interactive authentication. Key options add destination restrictions. Enforcement belongs to `sshd`; see the [OpenSSH configuration manual](https://man.openbsd.org/sshd_config).
-
-The helper does not install or start your web/DB/API services. Keep them bound to loopback where appropriate, expose SSH through the firewall, and ensure other SSH `Match` rules are compatible. The helper audits the effective policy before accepting the account.
-
-Explicit Make administration shortcuts also remain:
-
-```sh
-sudo make create TUNNEL_USER=svc_tunnel PUBKEY_FILE=/path/to/sservcli.pub \
-  PERMIT_OPEN="127.0.0.1:8080 127.0.0.1:5432"
-sudo make audit TUNNEL_USER=svc_tunnel PERMIT_OPEN="127.0.0.1:8080 127.0.0.1:5432"
-sudo make delete TUNNEL_USER=svc_tunnel
-```
-
-`bundle` gets its account/destinations from `CONFIG`, not these shortcut variables.
+`install` remains create-only; legacy bundling uses idempotent `ensure`. These commands manage the previous restricted `sshd` accounts and do not configure the new token server. Token mode does not remove or change previously provisioned accounts. See the [OpenSSH server manual](https://man.openbsd.org/sshd_config) for its separate policy controls.
 
 ## Verification and troubleshooting
 
 ```sh
 make check test
-make integration
-# Optional Linux GUI checks:
-SSERVCLI_GUI_TESTS=1 xvfb-run -a python3 -m unittest discover -s tests -p test_desktop.py -v
+make integration  # additionally requires local openssh-server for legacy tests
+# Optional real Tk checks on Linux, with Xvfb installed:
+SSERVCLI_GUI_TESTS=1 xvfb-run -a .venv/bin/python -m unittest discover -s tests -p test_desktop.py -v
 ```
 
-Unit tests cover configuration, argument handling, bundle contents/checksums, instance notification, TCP tables, and provisioning rollback. Integration tests use isolated temporary `sshd` and real services to verify multiple forwards, host verification, key/Agent authentication, failover, reconnection, access restrictions, and shutdown. They do not modify real server accounts. Native Windows tests exercise listener ownership, child cleanup, tray lifecycle, and Tk widgets in CI.
+Tests cover token alphabet/length/case, rate limits, rotation and expiry, persistent identity, checking identity before sending a token, one SSH transport for multiple services, half-close/large payloads, forbidden destinations/channels, failover/reconnect, local credential storage, bundle secret exclusion, and the previous key/account workflow. Real SSH tests use temporary state and local services; no production accounts are modified. Native Windows tests cover DPAPI, listener ownership, tray lifecycle, and child cleanup for legacy mode.
 
-For `Permission denied (publickey)`, check that the Windows key/Agent matches `PUBKEY_FILE`. For a host key mismatch, verify the new key with the administrator before updating the profile. For an occupied local port, stop the old client or choose another unused port. Diagnose remote service health separately from SSH listener readiness.
+If a token is rejected, check its case, obtain the latest startup token, and wait 60 seconds after repeated failures. If the server key mismatches, verify the server identity with the administrator before replacing the client's profile; deleting the state directory creates a new identity. If a local port is occupied, stop the older client or change that service's local port. If SSH is ready but a service fails, check the corresponding application on server loopback.
 
-For missing Tkinter, repair Python with Tcl/Tk enabled (Ubuntu: `sudo apt-get install python3-tk`). If `py -3` selects an old installation, launch with the full path to Python 3.11+ using `-m sservcli desktop --config services.json`. When tray initialization fails, the app keeps the window accessible. Startup tracebacks from `Start.cmd` are saved to `%LOCALAPPDATA%\sservcli\desktop.log`.
+For missing Tkinter, repair the Python installation with Tcl/Tk enabled (Ubuntu desktop: `sudo apt-get install python3-tk`). Run `Build.cmd` again if Python dependencies are missing on Windows. The installer accepts only binary wheels and reports an error instead of attempting a Rust/C build if compatible wheels are unavailable. No `gh` or GitHub build is used. Native Windows execution still needs verification on a Windows machine; the repository provides the corresponding tests.

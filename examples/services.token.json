@@ -1,0 +1,56 @@
+{
+  "version": 2,
+  "name": "My server",
+  "ssh": {
+    "host": "server.example.com",
+    "fallback_hosts": [],
+    "port": 8022
+  },
+  "reconnect": {
+    "enabled": true,
+    "max_attempts": 5,
+    "initial_delay_secs": 2,
+    "max_delay_secs": 30
+  },
+  "services": [
+    {
+      "id": "dashboard",
+      "name": "Web dashboard",
+      "kind": "web",
+      "remote_host": "127.0.0.1",
+      "remote_port": 8080,
+      "local_port": 18080,
+      "enabled": true,
+      "path": "/"
+    },
+    {
+      "id": "postgres",
+      "name": "PostgreSQL",
+      "kind": "database",
+      "remote_host": "127.0.0.1",
+      "remote_port": 5432,
+      "local_port": 15432,
+      "enabled": true,
+      "launch": [
+        "psql",
+        "-h",
+        "{host}",
+        "-p",
+        "{port}",
+        "-U",
+        "app",
+        "app"
+      ]
+    },
+    {
+      "id": "api",
+      "name": "REST API",
+      "kind": "api",
+      "remote_host": "127.0.0.1",
+      "remote_port": 9000,
+      "local_port": 19000,
+      "enabled": true,
+      "path": "/docs"
+    }
+  ]
+}
