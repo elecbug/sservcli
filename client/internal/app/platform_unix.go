@@ -8,7 +8,6 @@ import (
 	"os"
 	"os/exec"
 	"syscall"
-	"time"
 )
 
 func configureCommand(cmd *exec.Cmd)          {}
@@ -42,25 +41,5 @@ func lockFile(path string) (*os.File, error) {
 		return nil, fmt.Errorf("another client is running or lock is unsafe: %w", err)
 	}
 	return f, nil
-}
-func platformReady(cmd *exec.Cmd, control, host string, ports []int) bool {
-	if _, err := os.Stat(control); err != nil {
-		return false
-	}
-	check := exec.Command(openSSH("ssh"), "-F", "none", "-S", control, "-O", "check", host)
-	configureCommand(check)
-	done := make(chan error, 1)
-	if check.Start() != nil {
-		return false
-	}
-	go func() { done <- check.Wait() }()
-	select {
-	case err := <-done:
-		return err == nil
-	case <-time.After(time.Second):
-		_ = check.Process.Kill()
-		<-done
-		return false
-	}
 }
 func browserCommand(url string) *exec.Cmd { return exec.Command("xdg-open", url) }

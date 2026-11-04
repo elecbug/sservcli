@@ -105,16 +105,13 @@ func sshPath(path string) string {
 	}
 	return path
 }
-func sshArgs(p Profile, known, control, host string) []string {
+func sshArgs(p Profile, known, host string) []string {
 	args := []string{"-F", "none", "-N", "-T", "-n"}
-	options := []string{"StrictHostKeyChecking=yes", "GlobalKnownHostsFile=none", "UpdateHostKeys=no", "ExitOnForwardFailure=yes", "ServerAliveInterval=20", "ServerAliveCountMax=3", "ConnectTimeout=10", "ConnectionAttempts=1", "KbdInteractiveAuthentication=no", "ForwardAgent=no", "ForwardX11=no", "GatewayPorts=no", "LogLevel=VERBOSE", `UserKnownHostsFile="` + sshPath(known) + `"`}
+	options := []string{"StrictHostKeyChecking=yes", "GlobalKnownHostsFile=none", "UpdateHostKeys=no", "ExitOnForwardFailure=yes", "ServerAliveInterval=20", "ServerAliveCountMax=3", "ConnectTimeout=10", "ConnectionAttempts=1", "KbdInteractiveAuthentication=no", "ForwardAgent=no", "ForwardX11=no", "GatewayPorts=no", "LogLevel=DEBUG1", `UserKnownHostsFile="` + sshPath(known) + `"`}
 	if p.Version == 2 {
 		options = append(options, "BatchMode=no", "PreferredAuthentications=password", "PasswordAuthentication=yes", "PubkeyAuthentication=no", "NumberOfPasswordPrompts=1")
 	} else {
 		options = append(options, "BatchMode=yes", "PreferredAuthentications=publickey", "PasswordAuthentication=no")
-	}
-	if runtime.GOOS != "windows" {
-		options = append(options, "ControlPersist=no", "ControlMaster=yes", `ControlPath="`+sshPath(control)+`"`)
 	}
 	if p.SSH.Identity != "" {
 		options = append(options, "IdentitiesOnly=yes")
@@ -235,7 +232,6 @@ func (t *Tunnel) run(ctx context.Context, p Profile, token string) (err error) {
 	if fingerprint != "" {
 		t.log("[pinned host key] " + fingerprint)
 	}
-	control := filepath.Join(directory, "ctl")
 	hosts := p.Hosts()
 	retries, first := 0, 0
 	for ctx.Err() == nil {
@@ -244,10 +240,9 @@ func (t *Tunnel) run(ctx context.Context, p Profile, token string) (err error) {
 		for offset := 0; offset < len(hosts) && ctx.Err() == nil; offset++ {
 			index := (first + offset) % len(hosts)
 			host := hosts[index]
-			_ = os.Remove(control)
 			t.update("connecting", fmt.Sprintf("Connecting to %s:%d (address %d/%d)", host, p.SSH.Port, offset+1, len(hosts)), retries, host)
 			var fatal bool
-			connected, message, fatal = t.connection(ctx, p, token, known, control, host, retries)
+			connected, message, fatal = t.connection(ctx, p, token, known, host, retries)
 			if ctx.Err() != nil {
 				return nil
 			}
@@ -257,6 +252,9 @@ func (t *Tunnel) run(ctx context.Context, p Profile, token string) (err error) {
 			if connected {
 				first = (index + 1) % len(hosts)
 				break
+			}
+			if offset+1 < len(hosts) {
+				t.log("[address failed] " + message)
 			}
 		}
 		if ctx.Err() != nil {
@@ -284,11 +282,15 @@ func (t *Tunnel) run(ctx context.Context, p Profile, token string) (err error) {
 }
 
 type sshLog struct {
-	mu      sync.Mutex
-	partial string
-	lines   []string
-	token   string
-	tunnel  *Tunnel
+	mu            sync.Mutex
+	partial       string
+	token         string
+	tunnel        *Tunnel
+	authenticated bool
+	session       bool
+	listeners     map[int]bool
+	fatal         bool
+	rejected      bool
 }
 
 func (w *sshLog) Write(data []byte) (int, error) {
@@ -307,12 +309,37 @@ func (w *sshLog) Write(data []byte) (int, error) {
 			}
 			return -1
 		}, line)
+		progress := strings.TrimPrefix(line, "debug1: ")
+		if strings.HasPrefix(progress, "Authenticated to ") || strings.HasPrefix(progress, "Authentication succeeded (") {
+			w.authenticated = true
+		}
+		if line == "debug1: Entering interactive session." {
+			w.session = true
+		}
+		const listening = "debug1: Local forwarding listening on 127.0.0.1 port "
+		if strings.HasPrefix(line, listening) && strings.HasSuffix(line, ".") {
+			port, err := strconv.Atoi(strings.TrimSuffix(strings.TrimPrefix(line, listening), "."))
+			if err == nil && port > 0 && port <= 65535 {
+				if w.listeners == nil {
+					w.listeners = map[int]bool{}
+				}
+				w.listeners[port] = true
+			}
+		}
+		if strings.Contains(line, "HOST IDENTIFICATION HAS CHANGED") || strings.Contains(line, "Host key verification failed") || strings.Contains(line, "Could not request local forwarding") {
+			w.fatal = true
+		}
+		if !strings.HasPrefix(line, "bind [") && !strings.HasPrefix(line, "listen [") &&
+			(strings.Contains(line, ": Permission denied (") || strings.Contains(line, "Permission denied, please try again.")) {
+			w.fatal, w.rejected = true, true
+		}
+		// DEBUG1 supplies lifecycle events without filling the management log
+		// with key exchange details. Warnings and authentication results remain.
+		if strings.HasPrefix(line, "debug1:") {
+			continue
+		}
 		if w.token != "" {
 			line = strings.ReplaceAll(line, w.token, "[redacted]")
-		}
-		w.lines = append(w.lines, line)
-		if len(w.lines) > 50 {
-			w.lines = w.lines[len(w.lines)-50:]
 		}
 		w.tunnel.log(line)
 	}
@@ -324,19 +351,34 @@ func (w *sshLog) Write(data []byte) (int, error) {
 func (w *sshLog) result() (bool, bool) {
 	w.mu.Lock()
 	defer w.mu.Unlock()
-	fatal, rejected := false, false
-	for _, line := range w.lines {
-		if strings.Contains(line, "HOST IDENTIFICATION HAS CHANGED") || strings.Contains(line, "Host key verification failed") || strings.Contains(line, "Permission denied") {
-			fatal = true
-		}
-		if strings.Contains(line, "Permission denied") {
-			rejected = true
+	return w.fatal, w.rejected
+}
+func (w *sshLog) forwardingReady(ports []int) bool {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	// OpenSSH enters its session loop only after authentication and successful
+	// forwarding setup (ExitOnForwardFailure=yes). The earlier listening log
+	// alone occurs before bind(), so it must not count as success.
+	if !w.authenticated || !w.session || w.fatal || len(ports) == 0 {
+		return false
+	}
+	for _, port := range ports {
+		if !w.listeners[port] {
+			return false
 		}
 	}
-	return fatal, rejected
+	return true
 }
-func (t *Tunnel) connection(ctx context.Context, p Profile, token, known, control, host string, attempt int) (connected bool, message string, fatal bool) {
-	cmd := exec.Command(openSSH("ssh"), sshArgs(p, known, control, host)...)
+func (w *sshLog) startupFailure(host string) (string, bool) {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	if w.authenticated {
+		return host + ": SSH token/key authentication succeeded, but local forwarding readiness was not confirmed; see connection log", true
+	}
+	return host + ": SSH startup timed out before authentication", false
+}
+func (t *Tunnel) connection(ctx context.Context, p Profile, token, known, host string, attempt int) (connected bool, message string, fatal bool) {
+	cmd := exec.Command(openSSH("ssh"), sshArgs(p, known, host)...)
 	configureSSH(cmd)
 	cmd.Env = childEnvironment(token)
 	logs := &sshLog{token: token, tunnel: t}
@@ -388,10 +430,11 @@ func (t *Tunnel) connection(ctx context.Context, p Profile, token, known, contro
 			return connected, fmt.Sprintf("%s: SSH exited (%v); see connection log", host, err), fatal
 		case <-deadline.C:
 			if !connected {
-				return false, host + ": SSH startup timed out", false
+				message, fatal = logs.startupFailure(host)
+				return false, message, fatal
 			}
 		case <-ticker.C:
-			if !connected && platformReady(cmd, control, host, ports) {
+			if !connected && logs.forwardingReady(ports) {
 				connected = true
 				t.update("connected", "Connected to "+host+"; all enabled local listeners are ready (service health is not checked)", attempt, host)
 			}

@@ -115,6 +115,8 @@ Useful commands:
 
 Launching the EXE without arguments starts the background client and opens management. It does not install a login task or system service. Runtime metadata, a process lock, and logs live in `.sservcli/` beside the executable; neither the control metadata nor logs contain the shared SSH token. Keep port 8000 available for management, or pass `--web-port` to `start`/`run`. SSH readiness does not prove that each remote application is healthy.
 
+An SSH log saying `Authenticated ... using "password"` means the shared token was accepted. The client supplies that password automatically from `.token`. Connection status becomes ready after OpenSSH confirms authentication, all enabled loopback forwarding ports, and session startup. This uses the same lifecycle signals on Windows and Linux. If an address fails before startup completes, its failure is logged before the next address is tried.
+
 After restarting the server, the old token stops working. Regenerate the ZIP with `make docker-bundle` (Docker) or `make bundle` (native host), or replace the client's `.token` with the new token and reconnect. The SSH host key does not change during token rotation.
 
 ## Service configuration

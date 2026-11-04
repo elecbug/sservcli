@@ -100,7 +100,7 @@ func TestSSHUsesOneTransportAllEnabledServicesAndStrictAuth(t *testing.T) {
 	p := fixture(t)
 	no := false
 	p.Services[2].Enabled = &no
-	args := sshArgs(p, "known_hosts", "control", "127.0.0.1")
+	args := sshArgs(p, "known_hosts", "127.0.0.1")
 	count := 0
 	for _, arg := range args {
 		if arg == "-L" {
@@ -111,7 +111,7 @@ func TestSSHUsesOneTransportAllEnabledServicesAndStrictAuth(t *testing.T) {
 		t.Fatal(args)
 	}
 	joined := strings.Join(args, "\n")
-	for _, value := range []string{"StrictHostKeyChecking=yes", "ExitOnForwardFailure=yes", "PreferredAuthentications=password", "PubkeyAuthentication=no", "NumberOfPasswordPrompts=1", "127.0.0.1:18080:127.0.0.1:8080"} {
+	for _, value := range []string{"StrictHostKeyChecking=yes", "ExitOnForwardFailure=yes", "LogLevel=DEBUG1", "PreferredAuthentications=password", "PubkeyAuthentication=no", "NumberOfPasswordPrompts=1", "127.0.0.1:18080:127.0.0.1:8080"} {
 		if !strings.Contains(joined, value) {
 			t.Errorf("missing %s", value)
 		}
@@ -121,7 +121,7 @@ func TestSSHUsesOneTransportAllEnabledServicesAndStrictAuth(t *testing.T) {
 	}
 	p.Version = 1
 	p.SSH.Identity = "client_key"
-	args = sshArgs(p, "known_hosts", "control", p.SSH.Host)
+	args = sshArgs(p, "known_hosts", p.SSH.Host)
 	if !strings.Contains(strings.Join(args, " "), "BatchMode=yes") {
 		t.Fatal(args)
 	}
@@ -139,13 +139,69 @@ func TestTokenRedactionAndScopedAskpass(t *testing.T) {
 	tunnel := newTunnel(io.Discard)
 	log := &sshLog{tunnel: tunnel, token: "Ab1Cd2E3"}
 	_, _ = log.Write([]byte("debug Ab1C"))
-	_, _ = log.Write([]byte("d2E3 value\nPermission denied\n"))
+	_, _ = log.Write([]byte("d2E3 value\ntunnel@server: Permission denied (password).\n"))
 	if strings.Contains(strings.Join(tunnel.snapshot().Logs, ""), "Ab1Cd2E3") {
 		t.Fatal("secret leaked to log")
 	}
 	fatal, rejected := log.result()
 	if !fatal || !rejected {
 		t.Fatal("auth failure should stop retrying")
+	}
+}
+
+// These are the same lifecycle messages emitted by native OpenSSH on Windows
+// and Unix. In particular, a listening message is printed before bind succeeds.
+func TestSSHReadinessWaitsForEveryForwardAndSessionStartup(t *testing.T) {
+	tunnel := newTunnel(io.Discard)
+	log := &sshLog{tunnel: tunnel, token: "forwardi"}
+	_, _ = log.Write([]byte("Authenticated to 192.0.2.10 ([192.0.2.10]:21200) using \"password\".\r\n"))
+	if log.forwardingReady([]int{18080, 15432}) {
+		t.Fatal("authentication alone is not forwarding readiness")
+	}
+	_, _ = log.Write([]byte("debug1: Local forwarding listening on 127.0.0.1 port 18080.\r\n"))
+	if log.forwardingReady([]int{18080, 15432}) {
+		t.Fatal("one listener is not enough")
+	}
+	_, _ = log.Write([]byte("debug1: Local forwarding listening on 127.0.0.1 port 15432.\r\n"))
+	if log.forwardingReady([]int{18080, 15432}) {
+		t.Fatal("pre-bind messages must not signal readiness")
+	}
+	_, _ = log.Write([]byte("debug1: Entering interactive ses"))
+	if log.forwardingReady([]int{18080, 15432}) {
+		t.Fatal("an incomplete event must not signal readiness")
+	}
+	_, _ = log.Write([]byte("sion.\r\n"))
+	if !log.forwardingReady([]int{18080, 15432}) {
+		t.Fatal("authenticated transport with every forward should be ready")
+	}
+	if log.forwardingReady(nil) || log.forwardingReady([]int{19000}) {
+		t.Fatal("unconfigured/missing listeners should not be ready")
+	}
+	if strings.Contains(strings.Join(tunnel.snapshot().Logs, "\n"), "debug1:") {
+		t.Fatal("internal progress details clutter the management log")
+	}
+}
+func TestSSHBindFailureIsNotReportedAsARejectedToken(t *testing.T) {
+	log := &sshLog{tunnel: newTunnel(io.Discard)}
+	_, _ = log.Write([]byte("Authenticated to server using \"password\".\n" +
+		"debug1: Local forwarding listening on 127.0.0.1 port 18080.\n" +
+		"bind [127.0.0.1]:18080: Permission denied\nCould not request local forwarding.\n"))
+	fatal, rejected := log.result()
+	if !fatal || rejected || log.forwardingReady([]int{18080}) {
+		t.Fatal("a local bind failure is fatal without rejecting the shared token")
+	}
+}
+func TestSSHReadinessRejectsMissingAuthenticationAndWrongBindAddresses(t *testing.T) {
+	log := &sshLog{tunnel: newTunnel(io.Discard)}
+	_, _ = log.Write([]byte("debug1: Local forwarding listening on 127.0.0.1 port 18080.\n" +
+		"debug1: Entering interactive session.\n"))
+	if log.forwardingReady([]int{18080}) {
+		t.Fatal("authentication is required")
+	}
+	_, _ = log.Write([]byte("debug1: Authentication succeeded (publickey).\n" +
+		"debug1: Local forwarding listening on 0.0.0.0 port 15432.\n"))
+	if !log.forwardingReady([]int{18080}) || log.forwardingReady([]int{15432}) {
+		t.Fatal("only configured loopback listeners count")
 	}
 }
 func TestOccupiedPortsAndDisabledServices(t *testing.T) {

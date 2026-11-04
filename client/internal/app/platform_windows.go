@@ -1,7 +1,6 @@
 package app
 
 import (
-	"encoding/binary"
 	"errors"
 	"fmt"
 	"os"
@@ -11,7 +10,6 @@ import (
 )
 
 var kernel = syscall.NewLazyDLL("kernel32.dll")
-var tcpTable = syscall.NewLazyDLL("iphlpapi.dll").NewProc("GetExtendedTcpTable")
 
 func configureCommand(cmd *exec.Cmd) {
 	cmd.SysProcAttr = &syscall.SysProcAttr{HideWindow: true, CreationFlags: 0x08000000}
@@ -88,36 +86,6 @@ func attachJob(cmd *exec.Cmd) (func(), error) {
 		return nil, err
 	}
 	return closeJob, nil
-}
-func platformReady(cmd *exec.Cmd, control, host string, ports []int) bool {
-	var size uint32
-	r, _, _ := tcpTable.Call(0, uintptr(unsafe.Pointer(&size)), 0, 2, 3, 0)
-	if r != 122 || size < 4 || size > 32*1024*1024 {
-		return false
-	}
-	data := make([]byte, size)
-	r, _, _ = tcpTable.Call(uintptr(unsafe.Pointer(&data[0])), uintptr(unsafe.Pointer(&size)), 0, 2, 3, 0)
-	if r != 0 {
-		return false
-	}
-	found := map[int]bool{}
-	count := int(binary.LittleEndian.Uint32(data[:4]))
-	for i := 0; i < count; i++ {
-		offset := 4 + i*24
-		if offset+24 > len(data) {
-			return false
-		}
-		row := data[offset : offset+24]
-		if binary.LittleEndian.Uint32(row[:4]) == 2 && row[4] == 127 && row[5] == 0 && row[6] == 0 && row[7] == 1 && binary.LittleEndian.Uint32(row[20:24]) == uint32(cmd.Process.Pid) {
-			found[int(binary.BigEndian.Uint16(row[8:10]))] = true
-		}
-	}
-	for _, port := range ports {
-		if !found[port] {
-			return false
-		}
-	}
-	return true
 }
 func browserCommand(url string) *exec.Cmd {
 	return exec.Command("rundll32.exe", "url.dll,FileProtocolHandler", url)
