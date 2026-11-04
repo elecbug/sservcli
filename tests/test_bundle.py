@@ -4,6 +4,7 @@ from pathlib import Path
 import hashlib
 import sys
 import subprocess
+import struct
 import tempfile
 import unittest
 from unittest.mock import patch
@@ -15,6 +16,9 @@ ROOT = Path(__file__).resolve().parents[1]
 spec = importlib.util.spec_from_file_location("bundle", ROOT / "tools/bundle_windows.py")
 bundle = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(bundle)
+
+RUNTIME_FILES = {"sservcli.exe", "sservcli-askpass.exe", "services.json", ".token",
+                 "Start.cmd", "Stop.cmd", "README.txt", "SHA256SUMS.txt"}
 
 
 class BundleTests(unittest.TestCase):
@@ -190,6 +194,14 @@ class BundleTests(unittest.TestCase):
             self.assertEqual(json.loads(archive.read("services.json")), self.config)
             self.assertIn("Start.cmd", archive.namelist())
 
+    def test_legacy_binary_bundle_only_contains_runtime_files(self):
+        self.args.source_only = False
+        with patch.object(bundle, "build_client", return_value={"sservcli.exe": b"MZclient", "sservcli-askpass.exe": b"MZaskpass"}):
+            output = bundle.package(self.args)
+        with zipfile.ZipFile(output) as archive:
+            self.assertEqual(set(archive.namelist()), RUNTIME_FILES - {".token"})
+            self.assertIn("host_public_key", json.loads(archive.read("services.json"))["ssh"])
+
     def test_validation_rejects_invalid_types_fields_and_service_settings(self):
         for mutation in range(7):
             config = json.loads(json.dumps(self.config))
@@ -302,13 +314,32 @@ class TokenBundleTests(unittest.TestCase):
                     bundle.package(self.args)
             self.assertFalse(self.args.output.exists())
 
-    def test_binary_bundle_contains_both_go_executables(self):
+    def test_binary_bundle_only_contains_runtime_files_and_current_token(self):
         self.args.source_only = False
-        with patch.object(bundle, "build_client", return_value={"sservcli.exe": b"MZclient", "sservcli-askpass.exe": b"MZaskpass"}):
+        with (patch.object(bundle, "source_files", side_effect=AssertionError("Binary bundles must not gather sources")),
+              patch.object(bundle, "build_client", return_value={"sservcli.exe": b"MZclient", "sservcli-askpass.exe": b"MZaskpass"})):
             output = bundle.package(self.args)
         with zipfile.ZipFile(output) as archive:
+            self.assertEqual(set(archive.namelist()), RUNTIME_FILES)
             self.assertEqual(archive.read("sservcli.exe"), b"MZclient")
             self.assertEqual(archive.read("sservcli-askpass.exe"), b"MZaskpass")
+            self.assertEqual(archive.read(".token").strip(), self.secret.encode())
+            self.assertEqual(json.loads(archive.read("services.json"))["ssh"]["host_public_key"], self.public)
+            guide = archive.read("README.txt")
+            self.assertNotIn(b"Build.cmd", guide)
+            self.assertNotIn(b"README.md", guide)
+            self.assertEqual(archive.read("Start.cmd").count(b"\n"), archive.read("Start.cmd").count(b"\r\n"))
+
+    def test_client_only_binary_zip_has_the_same_minimal_contents(self):
+        self.args.client_only = True
+        self.args.source_only = False
+        self.config["ssh"]["host_public_key"] = self.public
+        self.path.write_text(json.dumps(self.config))
+        with patch.object(bundle, "build_client", return_value={"sservcli.exe": b"MZclient", "sservcli-askpass.exe": b"MZaskpass"}):
+            output = bundle.package(self.args)
+        self.assertEqual(self.commands, [])
+        with zipfile.ZipFile(output) as archive:
+            self.assertEqual(set(archive.namelist()), RUNTIME_FILES)
             self.assertEqual(archive.read(".token").strip(), self.secret.encode())
 
     def test_missing_token_stops_before_server_account_changes(self):
@@ -316,6 +347,29 @@ class TokenBundleTests(unittest.TestCase):
         with self.assertRaisesRegex(bundle.BundleError, "Cannot read current token"):
             bundle.package(self.args)
         self.assertEqual(self.commands, [])
+
+    def test_container_bundle_uses_prebuilt_exes_and_the_pid_backend(self):
+        self.args.source_only = False
+        self.args.client_binaries = self.directory / "prebuilt"
+        self.args.client_binaries.mkdir()
+        data = bytearray(128)
+        data[:2] = b"MZ"
+        struct.pack_into("<I", data, 0x3c, 64)
+        data[64:68] = b"PE\0\0"
+        struct.pack_into("<H", data, 68, 0x8664)
+        for name in ("sservcli.exe", "sservcli-askpass.exe"):
+            (self.args.client_binaries / name).write_bytes(data)
+        self.args.sshd_pid_file = "/run/sservcli/sshd.pid"
+        output = bundle.package(self.args)
+        self.assertEqual(len(self.commands), 1)  # Account preparation only; no Go compiler.
+        self.assertIn("--sshd-pid-file", self.commands[0])
+        self.assertIn(self.args.sshd_pid_file, self.commands[0])
+        with zipfile.ZipFile(output) as archive:
+            self.assertEqual(set(archive.namelist()), RUNTIME_FILES)
+            self.assertEqual(archive.read(".token").strip(), self.secret.encode())
+        self.args.arch = "arm64"
+        with self.assertRaisesRegex(bundle.BundleError, "WINDOWS_ARCH=arm64"):
+            bundle.build_client(self.args)
 
 
 

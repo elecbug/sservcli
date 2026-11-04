@@ -9,6 +9,7 @@ import argparse
 import hashlib
 import hmac
 import stat
+import struct
 import importlib.util
 import json
 import os
@@ -41,12 +42,8 @@ def run(argv, *, timeout=3600, cwd=None, env=None):
     return result.stdout
 
 
-def source_files(root=ROOT):
-    """Explicit runtime allowlist: never walk arbitrary directories or key files."""
-    required = ["Build.cmd", "Start.cmd", "Stop.cmd", "README.md", "client/go.mod", "client/cmd/sservcli/main.go", "client/cmd/askpass/main.go",
-                "examples/services.token.json", "examples/services.token.windows.json"]
-    required += [f"client/internal/app/{name}.go" for name in (
-        "config", "tunnel", "daemon", "dashboard", "main", "platform_unix", "platform_windows", "process_linux", "process_other")]
+def read_files(required, root):
+    """Read only explicitly listed files, excluding links and arbitrary state."""
     files = {}
     for name in required:
         path = root / name
@@ -59,6 +56,18 @@ def source_files(root=ROOT):
             data = data.replace(b"\r\n", b"\n").replace(b"\n", b"\r\n")
         files[name] = data
     return files
+
+
+def runtime_files(root=ROOT):
+    return read_files(("Start.cmd", "Stop.cmd"), root)
+
+
+def source_files(root=ROOT):
+    required = ["Build.cmd", "Start.cmd", "Stop.cmd", "README.md", "client/go.mod", "client/cmd/sservcli/main.go", "client/cmd/askpass/main.go",
+                "examples/services.token.json", "examples/services.token.windows.json"]
+    required += [f"client/internal/app/{name}.go" for name in (
+        "config", "tunnel", "daemon", "dashboard", "main", "platform_unix", "platform_windows", "process_linux", "process_other")]
+    return read_files(required, root)
 
 
 def write_archive(output, files, directory):
@@ -89,6 +98,22 @@ def write_archive(output, files, directory):
 def build_client(args):
     if args.source_only:
         return {}
+    if args.client_binaries:
+        binaries = {}
+        machine = {"amd64": 0x8664, "arm64": 0xaa64}[args.arch]
+        for name in ("sservcli.exe", "sservcli-askpass.exe"):
+            path = args.client_binaries / name
+            if path.is_symlink() or not path.is_file() or not 64 <= path.stat().st_size <= 64 * 1024 * 1024:
+                raise BundleError(f"Missing or invalid prebuilt client: {name}")
+            data = path.read_bytes()
+            if len(data) < 64:
+                raise BundleError(f"Invalid prebuilt client: {name}")
+            offset = struct.unpack_from("<I", data, 0x3c)[0]
+            if (data[:2] != b"MZ" or offset + 6 > len(data) or data[offset:offset + 4] != b"PE\0\0"
+                    or struct.unpack_from("<H", data, offset + 4)[0] != machine):
+                raise BundleError(f"Prebuilt {name} does not match WINDOWS_ARCH={args.arch}; rebuild the server image")
+            binaries[name] = data
+        return binaries
     import shutil
     go = shutil.which("go")
     if not go:
@@ -110,11 +135,12 @@ def build_client(args):
 
 def client_archive(config, inputs, token=None):
     validate_profile(config)
+    source_only = "Build.cmd" in inputs
     files = {**inputs, "services.json": (json.dumps(config, indent=2) + "\n").encode(),
              "README.txt": ("sservcli Go Windows client\r\n\r\n"
                 "Extract the entire ZIP under your Windows user account. Enable Windows OpenSSH Client.\r\n"
-                "A bundled sservcli.exe needs neither Python nor Go installed.\r\n"
-                "If the EXE is absent, install Go and run Build.cmd once.\r\n"
+                + ("Install Go and run Build.cmd once to build this source-only download.\r\n" if source_only else
+                   "Python and Go are not required. Keep both EXEs beside services.json.\r\n")
                 + ("The current case-sensitive 8-character startup token is included in .token beside sservcli.exe.\r\n" if config["version"] == 2 else
                    "This key/Agent profile uses your existing authorized private key.\r\n") +
                 "Run Start.cmd. All enabled services forward in the background.\r\n"
@@ -122,26 +148,26 @@ def client_archive(config, inputs, token=None):
                 "Run Stop.cmd or sservcli.exe stop to release all forwards. Closing the browser keeps SSH running.\r\n"
                 "sservcli.exe list shows the service catalog. services.json and .token are read beside the EXE.\r\n"
                 "Keep this ZIP private: .token grants forwarding access. Restarting make server requires a new token/ZIP.\r\n"
-                "No private keys or Python files are included. See README.md for details.\r\n").encode()}
+                "No private keys or Python files are included.\r\n"
+                + ("See README.md for details.\r\n" if source_only else
+                   "Use sservcli.exe help for command-line options.\r\n")).encode()}
     if config["version"] == 2:
         files[".token"] = (validate_token(token) + "\n").encode("ascii")
-    if config["ssh"].get("host_public_key"):
-        files["server-host-key.pub"] = (config["ssh"]["host_public_key"].strip() + "\n").encode()
     return files
 
 
 def archive_inputs(args):
-    inputs = source_files()
-    if not args.dry_run:
-        executable = build_client(args)
-        if executable:
-            inputs.update(executable)
+    inputs = source_files() if args.source_only else runtime_files()
+    if not args.dry_run and not args.source_only:
+        inputs.update(build_client(args))
     return inputs
 
 
 def server_command(args, operation, profile=None):
     command = [sys.executable, ROOT / "server/sservcli_server.py", operation,
                "--sshd-config", args.sshd_config, "--ssh-service", args.ssh_service]
+    if args.sshd_pid_file:
+        command += ["--sshd-pid-file", args.sshd_pid_file]
     if operation == "token-prepare":
         command += ["--config", profile, "--host-key", args.host_key, "--ensure-ssh"]
     elif operation == "ensure":
@@ -186,7 +212,7 @@ def package(args):
         token = bundle_token(args, config) if not args.dry_run else None
         inputs = archive_inputs(args)
         if args.dry_run:
-            print("Dry run: client profile and Go client source files validated; would publish:", output)
+            print("Dry run: client profile and package inputs validated; would publish:", output)
             return None
         output.parent.mkdir(parents=True, exist_ok=True)
         with tempfile.TemporaryDirectory(prefix=".sservcli-client-", dir=output.parent) as directory:
@@ -296,11 +322,14 @@ def parser():
                         help="Current token to include; defaults to SERVER_STATE/access.token (client-only also checks adjacent .token)")
     result.add_argument("--source-only", action="store_true", default=env.get("BUILD_CLIENT") == "0", help="Package Go sources without compiling an EXE")
     result.add_argument("--arch", choices=("amd64", "arm64"), default=env.get("WINDOWS_ARCH") or "amd64")
+    result.add_argument("--client-binaries", type=Path, default=Path(env["CLIENT_BINARIES"]) if env.get("CLIENT_BINARIES") else None,
+                        help="Use prebuilt Windows executables, as supplied in the Docker server image")
     result.add_argument("--state-dir", type=Path, default=Path(env.get("SERVER_STATE") or ROOT / "var/server"))
     result.add_argument("--token-port", type=int, default=int(env["TOKEN_PORT"]) if env.get("TOKEN_PORT") else None)
     result.add_argument("--output", type=Path, default=Path(env["BUNDLE_OUTPUT"]) if env.get("BUNDLE_OUTPUT") else None)
     result.add_argument("--sshd-config", default=env.get("SSHD_CONFIG", "/etc/ssh/sshd_config"))
     result.add_argument("--ssh-service", default=env.get("SSH_SERVICE", "ssh"))
+    result.add_argument("--sshd-pid-file", default=env.get("SSHD_PID_FILE") or None)
     result.add_argument("--dry-run", action="store_true", default=env.get("DRY_RUN") == "1")
     return result
 

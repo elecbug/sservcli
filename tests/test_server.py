@@ -1,6 +1,7 @@
 import argparse
 import importlib.util
 import json
+import os
 from pathlib import Path
 import shutil
 import tempfile
@@ -20,6 +21,22 @@ spec.loader.exec_module(server)
 
 
 class PolicyTests(unittest.TestCase):
+    def test_pid_backend_refuses_pid_one_and_unrelated_processes(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            directory = Path(temporary)
+            pid_file = directory / "sshd.pid"
+            args = argparse.Namespace(sshd_config=str(directory / "sshd_config"), ssh_service="ssh",
+                                      client_address="127.0.0.1", sshd_pid_file=str(pid_file))
+            manager = server.Provisioner(args)
+            with patch.object(server, "safe_file", side_effect=lambda path: path.stat()), patch.object(server.os, "kill") as kill:
+                pid_file.write_text("1\n")
+                with self.assertRaisesRegex(server.SetupError, "Invalid OpenSSH"):
+                    manager.reload()
+                pid_file.write_text(str(os.getpid()))
+                with self.assertRaisesRegex(server.SetupError, "does not refer to the OpenSSH"):
+                    manager.reload()
+            kill.assert_not_called()
+
     def test_profile_and_restrictions(self):
         with tempfile.TemporaryDirectory() as temporary:
             path = Path(temporary) / "profile.json"
@@ -355,6 +372,12 @@ class TransactionTests(unittest.TestCase):
         self.assertEqual(sum(command[0] == "usermod" for command in self.commands), 1)
         self.assertEqual(json.loads(self.p.state_path(user).read_text())["auth_mode"], "token")
         self.audit.assert_called_with(user, ["127.0.0.1:8080"], "token")
+
+    def test_container_bootstrap_prepares_locked_policy_without_a_running_daemon(self):
+        self.p.ensure_token("svc_tunnel", ["127.0.0.1:8080"], activate=False)
+        self.reload.assert_not_called()
+        self.audit.assert_called_with("svc_tunnel", ["127.0.0.1:8080"], "token")
+        self.assertIn(["usermod", "--lock", "svc_tunnel"], self.commands)
 
     def test_migrating_a_managed_key_account_preserves_key_files_and_uid(self):
         self.install()

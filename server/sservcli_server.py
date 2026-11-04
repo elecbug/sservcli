@@ -215,6 +215,7 @@ class Provisioner:
         if not re.fullmatch(r"[a-zA-Z0-9_.@-]+", self.service) or self.service.startswith("-"):
             raise SetupError("Invalid SSH systemd service name")
         self.sshd = shutil.which("sshd") or "/usr/sbin/sshd"
+        self.pid_file = Path(args.sshd_pid_file) if getattr(args, "sshd_pid_file", None) else None
         self.context = f"host=localhost,addr={args.client_address}"
         if not re.fullmatch(r"[0-9a-fA-F:.]+", args.client_address):
             raise SetupError("--client-address must be an IP address")
@@ -235,8 +236,33 @@ class Provisioner:
             raise SetupError("DisableForwarding prevents the configured tunnels")
         return result.stdout
 
+    def daemon_pid(self):
+        safe_file(self.pid_file)
+        value = self.pid_file.read_text().strip()
+        if not re.fullmatch(r"[1-9][0-9]{0,9}", value) or int(value) <= 1:
+            raise SetupError("Invalid OpenSSH daemon PID file")
+        pid = int(value)
+        try:
+            executable = Path(f"/proc/{pid}/exe").resolve(strict=True)
+        except OSError as error:
+            raise SetupError("OpenSSH daemon is not running") from error
+        if executable != Path(self.sshd).resolve():
+            raise SetupError("PID file does not refer to the OpenSSH daemon")
+        return pid
+
+    def ensure_ssh(self):
+        if self.pid_file:
+            self.syntax()
+            self.daemon_pid()
+        else:
+            run(["ssh-keygen", "-A"])
+            run(["systemctl", "enable", "--now", self.service])
+
     def reload(self):
-        run(["systemctl", "reload", self.service])
+        if self.pid_file:
+            os.kill(self.daemon_pid(), signal.SIGHUP)
+        else:
+            run(["systemctl", "reload", self.service])
 
     def restore(self, original, info):
         atomic_write(self.config, original, mode=stat.S_IMODE(info.st_mode), owner=(info.st_uid, info.st_gid))
@@ -315,7 +341,7 @@ class Provisioner:
             safe_directory(directory)
         return record, entry, block
 
-    def ensure_token(self, user, permitted):
+    def ensure_token(self, user, permitted, *, activate=True):
         info = safe_file(self.config)
         original = self.config.read_text()
         home = self.home_base / user
@@ -354,7 +380,7 @@ class Provisioner:
             record.update(user=user, uid=account(user).pw_uid, home=str(home), sshd_config=str(self.config.resolve()),
                           block_sha256=hashlib.sha256(block.encode()).hexdigest(), auth_mode="token")
             atomic_write(state_path, json.dumps(record, indent=2) + "\n")
-            if changed:
+            if changed and activate:
                 self.reload()
             if not was_token:
                 self.lock_token(user, record["uid"])
@@ -619,8 +645,7 @@ def token_command(args, provisioner, preferred, permitted):
     try:
         with management_lock():
             if args.ensure_ssh:
-                run(["ssh-keygen", "-A"])
-                run(["systemctl", "enable", "--now", provisioner.service])
+                provisioner.ensure_ssh()
             public = host_public_key(args.host_key, provisioner)
             user = provisioner.resolve_token_user(preferred)
             if args.command == "token-serve":
@@ -692,6 +717,8 @@ def parser():
         if command != "render":
             sub.add_argument("--sshd-config", default="/etc/ssh/sshd_config")
             sub.add_argument("--ssh-service", default="ssh")
+            sub.add_argument("--sshd-pid-file", default=os.environ.get("SSHD_PID_FILE") or None,
+                             help="Manage a running container sshd through its PID file instead of systemd")
             sub.add_argument("--client-address", default="127.0.0.1", help="Source IP used when auditing Match rules")
     return result
 
@@ -720,8 +747,7 @@ def main(argv=None):
         with management_lock():
             if args.command in ("install", "ensure"):
                 if args.ensure_ssh:
-                    run(["ssh-keygen", "-A"])
-                    run(["systemctl", "enable", "--now", provisioner.service])
+                    provisioner.ensure_ssh()
                 if args.command == "ensure":
                     # Machine-readable ownership receipt lets the bundler roll
                     # back only accounts created by this invocation, under lock.

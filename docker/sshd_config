@@ -1,0 +1,21 @@
+# The listen settings are created by the container supervisor before startup.
+Include /run/sservcli/listen.conf
+HostKey /state/ssh_host_ed25519
+PidFile /run/sservcli/sshd.pid
+UsePAM yes
+PermitRootLogin no
+PasswordAuthentication no
+PubkeyAuthentication no
+KbdInteractiveAuthentication no
+PermitEmptyPasswords no
+MaxSessions 0
+AllowAgentForwarding no
+X11Forwarding no
+PermitTTY no
+PermitTunnel no
+PermitUserRC no
+AllowTcpForwarding no
+AllowStreamLocalForwarding no
+PermitListen none
+LogLevel INFO
+# The account provisioner appends its forwarding-only Match User policy here.

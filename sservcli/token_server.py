@@ -14,10 +14,11 @@ ROOT = Path(__file__).resolve().parents[1]
 
 class TokenServer:
     def __init__(self, config, state_dir, *, sshd_config="/etc/ssh/sshd_config", ssh_service="ssh",
-                 host_key="/etc/ssh/ssh_host_ed25519_key.pub"):
+                 host_key="/etc/ssh/ssh_host_ed25519_key.pub", sshd_pid_file=None):
         self.profile = token_profile(config)
         self.state_dir = private_directory(state_dir)
         self.sshd_config, self.ssh_service, self.host_key = sshd_config, ssh_service, host_key
+        self.sshd_pid_file = sshd_pid_file
         self.stopping = threading.Event()
         self.process = self.state_lock = None
         self.token = self.public_key = self.user = None
@@ -33,6 +34,8 @@ class TokenServer:
             command = [sys.executable, str(ROOT / "server/sservcli_server.py"), "token-serve", "--config", str(policy),
                        "--sshd-config", str(self.sshd_config), "--ssh-service", self.ssh_service,
                        "--host-key", str(self.host_key), "--ensure-ssh"]
+            if self.sshd_pid_file:
+                command += ["--sshd-pid-file", str(self.sshd_pid_file)]
             if os.name == "nt":
                 raise ConfigError("Run the server token controller on Ubuntu/OpenSSH")
             if os.geteuid() != 0:

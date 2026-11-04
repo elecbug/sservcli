@@ -4,7 +4,39 @@ Forward several services through one verified **OpenSSH** connection. The client
 
 The server controller and account-provisioning tools remain Python 3.11+ standard-library programs. Transport still uses the existing system **`sshd`** and native **`ssh -L`**. Windows clients need OpenSSH Client, but neither Python nor Go is needed when the ZIP contains the compiled executables.
 
-## Server and Windows download
+## Server in Docker Compose
+
+On a Linux Docker host, the container uses host networking to access the existing services at `127.0.0.1:<remote_port>`. It runs its own OpenSSH daemon and token controller. The main profile is **`var/services.windows.json`**, mounted read-only. Its service addresses remain unchanged. The container defaults to SSH **2222**, and generated Windows profiles use that actual port instead of the native profile's SSH port.
+
+```sh
+make docker-up
+make docker-status
+make docker-bundle
+```
+
+If your account needs sudo to access Docker, use `make DOCKER="sudo docker" docker-up` and the same `DOCKER` setting for the other Docker targets. `docker-up` builds the image and waits for the server to become healthy; `docker-bundle` writes the minimal Windows download to `dist/sservcli-windows-token.zip`, including the current `.token`. The image builds both Windows EXEs once, so bundling inside the running container needs no Go compiler or systemd. When using the Make command, the ZIP belongs to the host user running Make and retains private permissions.
+
+Copy `examples/server.docker.env` to **`var/docker.env`** to customize the listener (an existing file is preserved):
+
+```dotenv
+SSERVCLI_SSH_PORT=2222
+SSERVCLI_LISTEN_ADDRESS=0.0.0.0
+```
+
+Choose an unused SSH port reachable by clients through the host firewall. `SSERVCLI_CONFIG=/path/to/profile.json make docker-up` selects a different profile. `WINDOWS_ARCH=arm64 make docker-up` builds ARM64 Windows clients; the default is AMD64. `make docker-bundle BUILD_CLIENT=0` retains the optional source-only download.
+
+The private host key and controller state persist in **`var/docker-server/`**, separate from the native server's `var/server`. Docker state is root-owned; access the token and create downloads through the container. The account and managed SSH configuration stay inside the container and are provisioned again after container recreation. The host's accounts, SSH configuration, and existing SSH listener are not mounted or changed. Stopping the container revokes its token and forwarding sessions; restarting issues a new token while preserving its host key. Existing native-server clients need a new Docker-generated ZIP with the container's host key and port.
+
+```sh
+make docker-logs                    # Follow SSH/controller logs
+docker compose restart server       # Issue a new token
+make docker-bundle                  # Download with the new token
+make docker-down                    # Stop the server; keep its state and downloads
+```
+
+The Compose service uses `network_mode: host`, without port mappings or a custom subnet. It shares the host network while keeping its filesystem and process namespace separate. [Docker host-network documentation](https://docs.docker.com/engine/network/drivers/host/)
+
+## Server on the host and Windows download
 
 On Ubuntu 24.04:
 
@@ -33,10 +65,11 @@ services.json
 .token
 Start.cmd
 Stop.cmd
-Build.cmd
-client/                 # Go sources; no third-party modules
 README.txt
+SHA256SUMS.txt
 ```
+
+The default bundle contains only the executables, connection files, start/stop scripts, a short usage guide, and checksums. Go sources, example profiles, `Build.cmd`, and repository documentation are omitted. The server public key is already pinned in `services.json`, so no separate public-key file is needed.
 
 **The current running server token is included in `.token`.** Bundling verifies it against the active dedicated account, without rotating it. Start `make server` first and run both commands as the same OS user with the same `CONFIG`, `SERVER_STATE`, and SSH settings. Missing, stale, or inactive tokens prevent publication. The host public key and actual selected SSH username are also included; private SSH keys stay on their original machines. Keep the downloaded ZIP private, since it contains a working credential.
 
@@ -46,7 +79,7 @@ To package Go sources and the current token without compiling on the server:
 make bundle CONFIG=services.json BUILD_CLIENT=0
 ```
 
-On Windows, install Go and run `Build.cmd` once for that source-only ZIP. This builds both Go executables; it does not use Python, pip, Rust, Node.js, or `gh`. `WINDOWS_ARCH=arm64` selects ARM64 for server-side compilation; the default is `amd64`. Existing ZIPs are preserved with suffixes such as `-2.zip`.
+This explicit source-only option includes the Go sources, `Build.cmd`, and supporting documentation. On Windows, install Go and run `Build.cmd` once for that ZIP. This builds both Go executables; it does not use Python, pip, Rust, Node.js, or `gh`. `WINDOWS_ARCH=arm64` selects ARM64 for server-side compilation; the default is `amd64`. Existing ZIPs are preserved with suffixes such as `-2.zip`.
 
 ## Run the client
 

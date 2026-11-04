@@ -17,6 +17,7 @@ def main(argv=None):
     command.add_argument("--port", type=int, default=int(os.environ["TOKEN_PORT"]) if os.environ.get("TOKEN_PORT") else None)
     command.add_argument("--sshd-config", default=os.environ.get("SSHD_CONFIG") or "/etc/ssh/sshd_config")
     command.add_argument("--ssh-service", default=os.environ.get("SSH_SERVICE") or "ssh")
+    command.add_argument("--sshd-pid-file", default=os.environ.get("SSHD_PID_FILE") or None)
     command.add_argument("--host-key", default=os.environ.get("HOST_KEY_FILE") or "/etc/ssh/ssh_host_ed25519_key.pub")
     args = parser.parse_args(argv)
     try:
@@ -30,7 +31,7 @@ def serve(args):
     from .token_server import TokenServer
     config = token_profile(load_profile(args.config), args.port)
     server = TokenServer(config, args.state_dir, sshd_config=args.sshd_config,
-                         ssh_service=args.ssh_service, host_key=args.host_key)
+                         ssh_service=args.ssh_service, host_key=args.host_key, sshd_pid_file=args.sshd_pid_file)
     stopping = False
 
     def stop(*_):

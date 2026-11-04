@@ -18,12 +18,16 @@ GO ?= go
 TOKEN_FILE ?= .token
 BUILD_CLIENT ?= 1
 WINDOWS_ARCH ?= amd64
+DOCKER ?= docker
+COMPOSE = $(DOCKER) compose
 
 export TUNNEL_USER PUBKEY_FILE PERMIT_OPEN SSHD_CONFIG SSH_SERVICE CONFIG
 export HOST_KEY_FILE BUNDLE_OUTPUT DRY_RUN BUNDLE_TOKEN_FILE
 export SERVER_STATE TOKEN_PORT LEGACY_SSH BUILD_CLIENT WINDOWS_ARCH
+export SSERVCLI_CONFIG
 
 .PHONY: help setup server-setup server create delete audit render build build-windows check test integration client bundle bundle-windows client-zip
+.PHONY: docker-config docker-build docker-up docker-down docker-logs docker-status docker-bundle
 
 help:
 	@printf '%s\n' \
@@ -31,13 +35,20 @@ help:
 	  'make build                           Build the Go client for this OS' \
 	  'make build-windows                   Cross-compile dist/sservcli.exe (no CGO)' \
 	  'make client CONFIG=services.json     Start the Go client and localhost:8000 management page' \
-	  'make bundle CONFIG=services.json     Prepare SSH account and create a Windows EXE/source ZIP' \
+	  'make bundle CONFIG=services.json     Prepare SSH account and create a minimal Windows runtime ZIP' \
 	  'make bundle CONFIG=services.json BUILD_CLIENT=0  Source ZIP; build later with Build.cmd' \
 	  'make bundle LEGACY_SSH=1 PUBKEY_FILE=<client.pub> CONFIG=<services.json>  Key/Agent mode' \
 	  'make client-zip CONFIG=<final-profile.json>  ZIP without server/account changes' \
 	  'make check test                      Validate Go/Python and run unit tests' \
 	  'make integration                     Run isolated native ssh/sshd tests' \
 	  'make render CONFIG=services.json     Preview restricted SSH policy'
+	@printf '%s\n' \
+	  'make docker-up                      Build/start the host-network server using var/services.windows.json' \
+	  'make docker-bundle                  Create the minimal Windows ZIP using the running container token' \
+	  'make docker-status                  Show container health' \
+	  'make docker-logs                    Follow server logs' \
+	  'make docker-down                    Stop the container and revoke its token' \
+	  'Use DOCKER="sudo docker" when Docker requires sudo; var/docker.env sets its SSH port'
 
 setup:
 	$(GO) version
@@ -91,3 +102,27 @@ bundle bundle-windows: server-setup
 
 client-zip:
 	"$(RUN_PYTHON)" tools/bundle_windows.py --client-only
+
+docker-config:
+	$(COMPOSE) config --quiet
+
+docker-build: docker-config
+	$(COMPOSE) build server
+
+docker-up: docker-config
+	mkdir -p dist var/docker-server
+	$(COMPOSE) up --build --wait --wait-timeout 60 -d server
+
+docker-down:
+	$(COMPOSE) down
+
+docker-logs:
+	$(COMPOSE) logs -f server
+
+docker-status:
+	$(COMPOSE) ps
+
+docker-bundle:
+	$(COMPOSE) exec -T -e BUILD_CLIENT="$$BUILD_CLIENT" -e DRY_RUN="$${DRY_RUN:-0}" \
+	  -e BUNDLE_UID="$$(id -u)" -e BUNDLE_GID="$$(id -g)" \
+	  server python3 server/container_runtime.py bundle

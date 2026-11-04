@@ -1,0 +1,27 @@
+# Allow only build/runtime sources. Never send var, tokens or local host keys.
+**
+!Dockerfile
+!.dockerignore
+!client/
+!client/go.mod
+!client/cmd/
+!client/cmd/**
+!client/internal/
+!client/internal/**
+!sservcli/
+!sservcli/*.py
+!server/
+!server/*.py
+!tools/
+!tools/bundle_windows.py
+!examples/
+!examples/services.token.json
+!examples/services.token.windows.json
+!docker/
+!docker/sshd_config
+!Build.cmd
+!Start.cmd
+!Stop.cmd
+!README.md
+**/__pycache__
+**/*_test.go
