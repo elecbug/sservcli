@@ -373,7 +373,7 @@ class TransactionTests(unittest.TestCase):
         self.assertEqual(json.loads(self.p.state_path(user).read_text())["auth_mode"], "token")
         self.audit.assert_called_with(user, ["127.0.0.1:8080"], "token")
 
-    def test_container_bootstrap_prepares_locked_policy_without_a_running_daemon(self):
+    def test_offline_setup_prepares_locked_policy_without_a_running_daemon(self):
         self.p.ensure_token("svc_tunnel", ["127.0.0.1:8080"], activate=False)
         self.reload.assert_not_called()
         self.audit.assert_called_with("svc_tunnel", ["127.0.0.1:8080"], "token")

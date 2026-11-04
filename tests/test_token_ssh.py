@@ -263,7 +263,7 @@ class NativeTokenSshTests(unittest.TestCase):
             with contextlib.suppress(ConnectionResetError):
                 self.assertEqual(stream.recv(1024), b'')
 
-    def test_container_pid_backend_reloads_real_sshd_without_systemd(self):
+    def test_pid_backend_reloads_existing_sshd_without_systemd(self):
         args = SimpleNamespace(sshd_config=str(self.directory / "sshd_config"), ssh_service="ssh",
                                sshd_pid_file=str(self.directory / "sshd.pid"), client_address="127.0.0.1")
         manager = provision.Provisioner(args)
@@ -274,13 +274,9 @@ class NativeTokenSshTests(unittest.TestCase):
         with patch.object(provision, "safe_file", side_effect=lambda path: path.stat()):
             self.assertEqual(manager.daemon_pid(), self.daemon.pid)
             config = self.directory / "sshd_config"
-            template = (ROOT / "docker/sshd_config").read_text()
-            template = template.replace("Include /run/sservcli/listen.conf", f"Port {self.port}\nListenAddress 127.0.0.1")
-            template = template.replace("/state/ssh_host_ed25519", str(self.directory / "host"))
-            template = template.replace("/run/sservcli/sshd.pid", str(self.directory / "sshd.pid"))
-            template = template.replace("UsePAM yes", "UsePAM no")
+            line = "    PermitOpen " + " ".join(f"127.0.0.1:{s['remote_port']}" for s in self.profile["services"])
             allowed = [f"127.0.0.1:{self.profile['services'][0]['remote_port']}"]
-            config.write_text(template + "\n" + provision.policy(self.user, allowed, "token"))
+            config.write_text(config.read_text().replace(line, "    PermitOpen " + allowed[0]))
             manager.ensure_ssh()
             manager.audit(self.user, allowed, "token")
             manager.reload()

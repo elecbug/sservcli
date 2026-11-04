@@ -4,37 +4,43 @@ Forward several services through one verified **OpenSSH** connection. The client
 
 The server controller and account-provisioning tools remain Python 3.11+ standard-library programs. Transport still uses the existing system **`sshd`** and native **`ssh -L`**. Windows clients need OpenSSH Client, but neither Python nor Go is needed when the ZIP contains the compiled executables.
 
-## Server in Docker Compose
+## Existing host SSH with Docker client packaging
 
-On a Linux Docker host, the container uses host networking to access the existing services at `127.0.0.1:<remote_port>`. It runs its own OpenSSH daemon and token controller. The main profile is **`var/services.windows.json`**, mounted read-only. Its service addresses remain unchanged. The container defaults to SSH **2222**, and generated Windows profiles use that actual port instead of the native profile's SSH port.
+The SSH server, forwarding account, and token controller run on the **host**. The host's existing SSH port and host key are used. Docker builds the Windows client and packages the download in a short-lived container that opens no network listener.
 
-```sh
-make docker-up
-make docker-status
-make docker-bundle
-```
+The main profile defaults to **`var/services.windows.json`**. Its `ssh.port` is preserved, so a profile using port 21200 continues to use 21200. Account setup, token issuance, host-key validation, and SSH policy reloads all happen on the host. No host private keys, SSH configuration, account database, or server-state directory is mounted into the builder.
 
-If your account needs sudo to access Docker, use `make DOCKER="sudo docker" docker-up` and the same `DOCKER` setting for the other Docker targets. `docker-up` builds the image and waits for the server to become healthy; `docker-bundle` writes the minimal Windows download to `dist/sservcli-windows-token.zip`, including the current `.token`. The image builds both Windows EXEs once, so bundling inside the running container needs no Go compiler or systemd. When using the Make command, the ZIP belongs to the host user running Make and retains private permissions.
-
-Copy `examples/server.docker.env` to **`var/docker.env`** to customize the listener (an existing file is preserved):
-
-```dotenv
-SSERVCLI_SSH_PORT=2222
-SSERVCLI_LISTEN_ADDRESS=0.0.0.0
-```
-
-Choose an unused SSH port reachable by clients through the host firewall. `SSERVCLI_CONFIG=/path/to/profile.json make docker-up` selects a different profile. `WINDOWS_ARCH=arm64 make docker-up` builds ARM64 Windows clients; the default is AMD64. `make docker-bundle BUILD_CLIENT=0` retains the optional source-only download.
-
-The private host key and controller state persist in **`var/docker-server/`**, separate from the native server's `var/server`. Docker state is root-owned; access the token and create downloads through the container. The account and managed SSH configuration stay inside the container and are provisioned again after container recreation. The host's accounts, SSH configuration, and existing SSH listener are not mounted or changed. Stopping the container revokes its token and forwarding sessions; restarting issues a new token while preserving its host key. Existing native-server clients need a new Docker-generated ZIP with the container's host key and port.
+If migrating from the previous standalone SSH container, remove it once:
 
 ```sh
-make docker-logs                    # Follow SSH/controller logs
-docker compose restart server       # Issue a new token
-make docker-bundle                  # Download with the new token
-make docker-down                    # Stop the server; keep its state and downloads
+make DOCKER="sudo docker" docker-down
 ```
 
-The Compose service uses `network_mode: host`, without port mappings or a custom subnet. It shares the host network while keeping its filesystem and process namespace separate. [Docker host-network documentation](https://docs.docker.com/engine/network/drivers/host/)
+Start host token management and leave it running:
+
+```sh
+make server
+# Or choose a profile explicitly:
+# make server CONFIG=var/services.windows.json
+```
+
+In another terminal, create the Windows download:
+
+```sh
+make DOCKER="sudo docker" docker-bundle
+```
+
+If your account already has Docker access, omit `DOCKER="sudo docker"`. The host needs Python 3.11+ and OpenSSH; Go is supplied by the Docker build image. The image is built first, then the host validates the current token and prepares a final profile with the actual forwarding username and system SSH public key. Only that profile and `.token` enter the packaging container through a temporary read-only input directory. The network-disabled container writes the minimal ZIP to `dist/sservcli-windows-token.zip`, preserving earlier downloads with numeric suffixes and assigning the new private ZIP to the host user.
+
+`var/server` holds host controller state and the current token. Stopping `make server` revokes that token and closes its forwarding sessions. Restarting it issues another token; rerun `make docker-bundle` or update the client's `.token`. The earlier `var/docker.env` listener settings and `var/docker-server` state are no longer used; those files can remain as backups.
+
+```sh
+make docker-build                   # Prepare the Windows builder image only
+make docker-up                      # Compatibility alias for docker-build
+make docker-bundle BUILD_CLIENT=0   # Source-only ZIP; compile later on Windows
+```
+
+The builder service in `docker-compose.yaml` runs with `network_mode: none`, a read-only root filesystem, temporary scratch space, staged client input, and an output directory. It exits after packaging. `make docker-up` does not start an SSH daemon or a persistent application container; use `make server` for the host controller. `WINDOWS_ARCH=arm64` selects ARM64 Windows executables; AMD64 is the default.
 
 ## Server on the host and Windows download
 
@@ -43,9 +49,10 @@ On Ubuntu 24.04:
 ```sh
 sudo apt-get update
 sudo apt-get install -y python3 openssh-server make
-cp examples/services.token.windows.json services.json
-# Edit ssh.host, optional ssh.fallback_hosts, and service ports.
-make server CONFIG=services.json
+mkdir -p var
+cp examples/services.token.windows.json var/services.windows.json
+# Edit ssh.host, ssh.port, optional ssh.fallback_hosts, and service ports.
+make server
 ```
 
 Keep this command running. It requests sudo, prepares/reuses a restricted account on the existing OpenSSH server, and issues a new case-sensitive **8-character token**. `ssh.port` must match your actual system SSH endpoint, normally **22**. The controller does not open another SSH port or start the underlying services.
@@ -53,7 +60,7 @@ Keep this command running. It requests sudo, prepares/reuses a restricted accoun
 In another terminal on that server:
 
 ```sh
-make bundle CONFIG=services.json
+make bundle
 ```
 
 With Go installed from [go.dev](https://go.dev/dl/), this cross-compiles the Windows client without CGO and creates `dist/sservcli-windows-token.zip`. The ZIP includes:
@@ -170,7 +177,7 @@ The server token file is `SERVER_STATE/access.token`, default `var/server/access
 
 | Input | Purpose |
 | --- | --- |
-| `CONFIG` | Services JSON; default `services.json` |
+| `CONFIG` | Services JSON; default `var/services.windows.json` |
 | `SERVER_STATE` | Running controller's private state directory; default `var/server` |
 | `BUILD_CLIENT=0` | Include sources and current token without compiling Windows executables |
 | `WINDOWS_ARCH` | Windows binary architecture: `amd64` (default) or `arm64` |

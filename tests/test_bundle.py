@@ -348,7 +348,7 @@ class TokenBundleTests(unittest.TestCase):
             bundle.package(self.args)
         self.assertEqual(self.commands, [])
 
-    def test_container_bundle_uses_prebuilt_exes_and_the_pid_backend(self):
+    def test_prebuilt_bundle_supports_an_optional_host_pid_backend(self):
         self.args.source_only = False
         self.args.client_binaries = self.directory / "prebuilt"
         self.args.client_binaries.mkdir()

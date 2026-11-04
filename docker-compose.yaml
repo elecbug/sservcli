@@ -1,40 +1,33 @@
 services:
-  server:
-    image: sservcli-server:local
+  builder:
+    image: sservcli-builder:local
+    profiles: [tools]
     build:
       context: .
-      target: server
+      target: bundle
       args:
         WINDOWS_ARCH: ${WINDOWS_ARCH:-amd64}
-    network_mode: host
+        BUILD_CLIENT: ${BUILD_CLIENT:-1}
+    network_mode: none
+    read_only: true
     init: true
-    restart: unless-stopped
-    stop_grace_period: 45s
-    env_file:
-      - path: ./var/docker.env
-        required: false
     environment:
-      CONFIG: /config/services.json
-      SERVER_STATE: /state
-      SSHD_CONFIG: /etc/ssh/sshd_config
-      SSHD_PID_FILE: /run/sservcli/sshd.pid
-      HOST_KEY_FILE: /state/ssh_host_ed25519.pub
+      BUILD_CLIENT: ${BUILD_CLIENT:-1}
+      WINDOWS_ARCH: ${WINDOWS_ARCH:-amd64}
       CLIENT_BINARIES: /opt/sservcli-client
-      BUNDLE_OUTPUT: /dist/sservcli-windows-token.zip
+      BUNDLE_INPUT: /input
+      BUNDLE_OUTPUT: /output/${SSERVCLI_BUNDLE_NAME:-sservcli-windows-token.zip}
+      BUNDLE_UID: ${SSERVCLI_BUNDLE_UID:-1000}
+      BUNDLE_GID: ${SSERVCLI_BUNDLE_GID:-1000}
     volumes:
       - type: bind
-        source: ${SSERVCLI_CONFIG:-./var/services.windows.json}
-        target: /config/services.json
+        source: ${SSERVCLI_BUNDLE_INPUT:-./var/.bundle-input}
+        target: /input
         read_only: true
         bind:
           create_host_path: false
-      - ./var/docker-server:/state
-      - ./dist:/dist
+      - type: bind
+        source: ${SSERVCLI_BUNDLE_OUTPUT:-./dist}
+        target: /output
     tmpfs:
-      - /run
-    healthcheck:
-      test: ["CMD", "python3", "/opt/sservcli/server/container_runtime.py", "healthcheck"]
-      interval: 10s
-      timeout: 3s
-      start_period: 10s
-      retries: 3
+      - /tmp

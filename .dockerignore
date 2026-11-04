@@ -14,11 +14,10 @@
 !server/*.py
 !tools/
 !tools/bundle_windows.py
+!tools/container_bundle.py
 !examples/
 !examples/services.token.json
 !examples/services.token.windows.json
-!docker/
-!docker/sshd_config
 !Build.cmd
 !Start.cmd
 !Stop.cmd

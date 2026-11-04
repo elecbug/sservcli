@@ -12,7 +12,7 @@ def main(argv=None):
     parser = argparse.ArgumentParser(description="Manage startup tokens on the existing OpenSSH server")
     commands = parser.add_subparsers(dest="command", required=True)
     command = commands.add_parser("serve")
-    command.add_argument("--config", type=Path, default=Path("services.json"))
+    command.add_argument("--config", type=Path, default=Path("var/services.windows.json"))
     command.add_argument("--state-dir", type=Path, default=Path(os.environ.get("SERVER_STATE") or "var/server"))
     command.add_argument("--port", type=int, default=int(os.environ["TOKEN_PORT"]) if os.environ.get("TOKEN_PORT") else None)
     command.add_argument("--sshd-config", default=os.environ.get("SSHD_CONFIG") or "/etc/ssh/sshd_config")

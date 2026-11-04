@@ -8,7 +8,7 @@ PUBKEY_FILE ?=
 PERMIT_OPEN ?= 127.0.0.1:8080 127.0.0.1:5432 127.0.0.1:9000
 SSHD_CONFIG ?= /etc/ssh/sshd_config
 SSH_SERVICE ?= ssh
-CONFIG ?= services.json
+CONFIG ?= var/services.windows.json
 PYTHON ?= python3
 VENV_DIR ?= .venv
 VENV_PYTHON = $(VENV_DIR)/bin/python
@@ -19,19 +19,18 @@ TOKEN_FILE ?= .token
 BUILD_CLIENT ?= 1
 WINDOWS_ARCH ?= amd64
 DOCKER ?= docker
-COMPOSE = $(DOCKER) compose
+COMPOSE = $(DOCKER) compose --profile tools
 
 export TUNNEL_USER PUBKEY_FILE PERMIT_OPEN SSHD_CONFIG SSH_SERVICE CONFIG
 export HOST_KEY_FILE BUNDLE_OUTPUT DRY_RUN BUNDLE_TOKEN_FILE
 export SERVER_STATE TOKEN_PORT LEGACY_SSH BUILD_CLIENT WINDOWS_ARCH
-export SSERVCLI_CONFIG
 
 .PHONY: help setup server-setup server create delete audit render build build-windows check test integration client bundle bundle-windows client-zip
-.PHONY: docker-config docker-build docker-up docker-down docker-logs docker-status docker-bundle
+.PHONY: docker-config docker-build docker-up docker-down docker-status docker-bundle
 
 help:
 	@printf '%s\n' \
-	  'make server CONFIG=services.json     Issue a token for the existing system sshd (Python/sudo)' \
+	  'make server                         Run host token management; use the existing SSH port from var/services.windows.json' \
 	  'make build                           Build the Go client for this OS' \
 	  'make build-windows                   Cross-compile dist/sservcli.exe (no CGO)' \
 	  'make client CONFIG=services.json     Start the Go client and localhost:8000 management page' \
@@ -43,12 +42,11 @@ help:
 	  'make integration                     Run isolated native ssh/sshd tests' \
 	  'make render CONFIG=services.json     Preview restricted SSH policy'
 	@printf '%s\n' \
-	  'make docker-up                      Build/start the host-network server using var/services.windows.json' \
-	  'make docker-bundle                  Create the minimal Windows ZIP using the running container token' \
-	  'make docker-status                  Show container health' \
-	  'make docker-logs                    Follow server logs' \
-	  'make docker-down                    Stop the container and revoke its token' \
-	  'Use DOCKER="sudo docker" when Docker requires sudo; var/docker.env sets its SSH port'
+	  'make docker-bundle                  Verify the host token; build/package the Windows client with Docker' \
+	  'make docker-build                   Build the one-shot client builder image' \
+	  'make docker-up                      Alias for docker-build; starts no SSH server' \
+	  'make docker-down                    Remove old project containers; host SSH stays active' \
+	  'Use DOCKER="sudo docker" when Docker requires sudo'
 
 setup:
 	$(GO) version
@@ -107,22 +105,16 @@ docker-config:
 	$(COMPOSE) config --quiet
 
 docker-build: docker-config
-	$(COMPOSE) build server
+	$(COMPOSE) build builder
 
-docker-up: docker-config
-	mkdir -p dist var/docker-server
-	$(COMPOSE) up --build --wait --wait-timeout 60 -d server
+docker-up: docker-build
+	@printf '%s\n' 'Client builder ready. Run make server on the host, then make docker-bundle.'
 
 docker-down:
-	$(COMPOSE) down
-
-docker-logs:
-	$(COMPOSE) logs -f server
+	$(COMPOSE) down --remove-orphans
 
 docker-status:
-	$(COMPOSE) ps
+	$(COMPOSE) ps -a
 
-docker-bundle:
-	$(COMPOSE) exec -T -e BUILD_CLIENT="$$BUILD_CLIENT" -e DRY_RUN="$${DRY_RUN:-0}" \
-	  -e BUNDLE_UID="$$(id -u)" -e BUNDLE_GID="$$(id -g)" \
-	  server python3 server/container_runtime.py bundle
+docker-bundle: server-setup
+	"$(RUN_PYTHON)" tools/docker_bundle.py --docker "$(DOCKER)"
