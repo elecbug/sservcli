@@ -111,7 +111,7 @@ def build_client(args):
             offset = struct.unpack_from("<I", data, 0x3c)[0]
             if (data[:2] != b"MZ" or offset + 6 > len(data) or data[offset:offset + 4] != b"PE\0\0"
                     or struct.unpack_from("<H", data, offset + 4)[0] != machine):
-                raise BundleError(f"Prebuilt {name} does not match WINDOWS_ARCH={args.arch}; rebuild the client builder image")
+                raise BundleError(f"Prebuilt {name} does not match WINDOWS_ARCH={args.arch}; rebuild the Docker image")
             binaries[name] = data
         return binaries
     import shutil
@@ -147,7 +147,7 @@ def client_archive(config, inputs, token=None):
                 "Open http://127.0.0.1:8000 for status, service addresses, connect/disconnect, and configuration.\r\n"
                 "Run Stop.cmd or sservcli.exe stop to release all forwards. Closing the browser keeps SSH running.\r\n"
                 "sservcli.exe list shows the service catalog. services.json and .token are read beside the EXE.\r\n"
-                "Keep this ZIP private: .token grants forwarding access. Restarting make server requires a new token/ZIP.\r\n"
+                "Keep this ZIP private: .token grants forwarding access. Restarting the server requires a new token/ZIP.\r\n"
                 "No private keys or Python files are included.\r\n"
                 + ("See README.md for details.\r\n" if source_only else
                    "Use sservcli.exe help for command-line options.\r\n")).encode()}
@@ -275,21 +275,25 @@ def bundle_token(args, config):
     try:
         return validate_token(read_private(path).rstrip("\r\n"))
     except (OSError, ValueError) as error:
-        raise BundleError(f"Cannot read current token from {path}; keep make server running or set BUNDLE_TOKEN_FILE to a private token file") from error
+        raise BundleError(f"Cannot read current token from {path}; keep the server running or set BUNDLE_TOKEN_FILE to a private token file") from error
 
 
 def prepare_token_client(args, config, token, directory):
     """Resolve the host account/key and verify this startup token on the host."""
     if server is None:
         raise BundleError("Prepare the server account on the SSH host; use --client-only for a final client profile")
-    profile_path = Path(directory) / "policy.json"
-    profile_path.write_text(json.dumps(config), encoding="utf-8")
-    receipt = json.loads(run(server_command(args, "token-prepare", profile_path)))
+    if getattr(args, "bridge_socket", None):
+        from sservcli.host_bridge import request
+        receipt = request(args.bridge_socket, "prepare", config).get("receipt")
+    else:
+        profile_path = Path(directory) / "policy.json"
+        profile_path.write_text(json.dumps(config), encoding="utf-8")
+        receipt = json.loads(run(server_command(args, "token-prepare", profile_path)))
     if not isinstance(receipt, dict) or not isinstance(receipt.get("user"), str) or not isinstance(receipt.get("host_public_key"), str):
         raise BundleError("Invalid OpenSSH preparation response")
     if (receipt.get("token_active") is not True or not isinstance(receipt.get("token_sha256"), str)
             or not hmac.compare_digest(receipt["token_sha256"], hashlib.sha256(token.encode()).hexdigest())):
-        raise BundleError("No matching active startup token. Keep make server running with the same CONFIG/SERVER_STATE, then run bundle again")
+        raise BundleError("No matching active startup token. Keep the server running with the same CONFIG/state, then run bundle again")
     server.username(receipt["user"])
     config["ssh"].update(user=receipt["user"], host_public_key=receipt["host_public_key"])
     validate_profile(config)
@@ -331,13 +335,16 @@ def parser():
     result.add_argument("--source-only", action="store_true", default=env.get("BUILD_CLIENT") == "0", help="Package Go sources without compiling an EXE")
     result.add_argument("--arch", choices=("amd64", "arm64"), default=env.get("WINDOWS_ARCH") or "amd64")
     result.add_argument("--client-binaries", type=Path, default=Path(env["CLIENT_BINARIES"]) if env.get("CLIENT_BINARIES") else None,
-                        help="Use prebuilt Windows executables, as supplied in the Docker client builder image")
+                        help="Use prebuilt Windows executables, as supplied in the Docker server image")
     result.add_argument("--state-dir", type=Path, default=Path(env.get("SERVER_STATE") or ROOT / "var/server"))
     result.add_argument("--token-port", type=int, default=int(env["TOKEN_PORT"]) if env.get("TOKEN_PORT") else None)
     result.add_argument("--output", type=Path, default=Path(env["BUNDLE_OUTPUT"]) if env.get("BUNDLE_OUTPUT") else None)
     result.add_argument("--sshd-config", default=env.get("SSHD_CONFIG", "/etc/ssh/sshd_config"))
     result.add_argument("--ssh-service", default=env.get("SSH_SERVICE", "ssh"))
     result.add_argument("--sshd-pid-file", default=env.get("SSHD_PID_FILE") or None)
+    result.add_argument("--bridge-socket", type=Path,
+                        default=Path(env["SSERVCLI_BRIDGE_SOCKET"]) if env.get("SSERVCLI_BRIDGE_SOCKET") else None,
+                        help="Use the approved host SSH helper through its private Unix socket (Docker)")
     result.add_argument("--dry-run", action="store_true", default=env.get("DRY_RUN") == "1")
     return result
 

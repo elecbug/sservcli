@@ -19,14 +19,14 @@ TOKEN_FILE ?= .token
 BUILD_CLIENT ?= 1
 WINDOWS_ARCH ?= amd64
 DOCKER ?= docker
-COMPOSE = $(DOCKER) compose --profile tools
+COMPOSE = "$(RUN_PYTHON)" tools/docker_compose.py --docker "$(DOCKER)" --
 
 export TUNNEL_USER PUBKEY_FILE PERMIT_OPEN SSHD_CONFIG SSH_SERVICE CONFIG
 export HOST_KEY_FILE BUNDLE_OUTPUT DRY_RUN BUNDLE_TOKEN_FILE
 export SERVER_STATE TOKEN_PORT LEGACY_SSH BUILD_CLIENT WINDOWS_ARCH
 
 .PHONY: help setup server-setup server create delete audit render build build-windows check test integration client bundle bundle-windows client-zip
-.PHONY: docker-config docker-build docker-up docker-down docker-status docker-bundle
+.PHONY: docker-config docker-build docker-up docker-down docker-status docker-logs docker-bundle
 
 help:
 	@printf '%s\n' \
@@ -42,10 +42,11 @@ help:
 	  'make integration                     Run isolated native ssh/sshd tests' \
 	  'make render CONFIG=services.json     Preview restricted SSH policy'
 	@printf '%s\n' \
-	  'make docker-bundle                  Verify the host token; build/package the Windows client with Docker' \
-	  'make docker-build                   Build the one-shot client builder image' \
-	  'make docker-up                      Alias for docker-build; starts no SSH server' \
-	  'make docker-down                    Remove old project containers; host SSH stays active' \
+	  'make docker-up                      Start the Docker server using the existing host SSH port' \
+	  'make docker-bundle                  Package the running Docker server token and Windows client' \
+	  'make docker-build                   Build the server image and Windows client' \
+	  'make docker-logs                    Follow the Docker server log' \
+	  'make docker-down                    Stop the Docker server and revoke its token; host SSH stays active' \
 	  'Use DOCKER="sudo docker" when Docker requires sudo'
 
 setup:
@@ -105,10 +106,12 @@ docker-config:
 	$(COMPOSE) config --quiet
 
 docker-build: docker-config
-	$(COMPOSE) build builder
+	$(COMPOSE) build server
 
 docker-up: docker-build
-	@printf '%s\n' 'Client builder ready. Run make server on the host, then make docker-bundle.'
+	"$(RUN_PYTHON)" server/ssh_bridge.py install --config "$$CONFIG" --sshd-config "$$SSHD_CONFIG" --ssh-service "$$SSH_SERVICE"
+	mkdir -p dist
+	@$(COMPOSE) up -d --force-recreate --wait --wait-timeout 60 server || { $(COMPOSE) logs --no-color --tail 100 server; exit 1; }
 
 docker-down:
 	$(COMPOSE) down --remove-orphans
@@ -116,5 +119,8 @@ docker-down:
 docker-status:
 	$(COMPOSE) ps -a
 
-docker-bundle: server-setup
-	"$(RUN_PYTHON)" tools/docker_bundle.py --docker "$(DOCKER)"
+docker-logs:
+	$(COMPOSE) logs -f --tail 100 server
+
+docker-bundle:
+	$(COMPOSE) exec -T -e BUNDLE_UID="$$(id -u)" -e BUNDLE_GID="$$(id -g)" -e BUILD_CLIENT="$(BUILD_CLIENT)" -e DRY_RUN="$${DRY_RUN:-0}" server python3 /opt/sservcli/server/container_server.py bundle

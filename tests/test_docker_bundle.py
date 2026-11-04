@@ -1,181 +1,177 @@
-"""Host SSH preparation and network-free Docker packaging; no privileged mutations."""
+"""Docker controller/ZIP flow over real Unix IPC, without host account changes."""
 import hashlib
 import json
 import os
 from pathlib import Path
 import shutil
 import subprocess
-import tempfile
 import unittest
 from unittest.mock import patch
 import zipfile
 
+from test_host_bridge import BridgeFixture
+from server import container_server
+from sservcli.config import ConfigError, load_profile
+from sservcli.token_auth import read_private, write_private
 from tools import bundle_windows as bundle
-from tools import container_bundle as consumer
-from tools import docker_bundle as producer
+from tools import docker_compose
 
 ROOT = Path(__file__).resolve().parents[1]
 RUNTIME_FILES = {"sservcli.exe", "sservcli-askpass.exe", "services.json", ".token",
                  "Start.cmd", "Stop.cmd", "README.txt", "SHA256SUMS.txt"}
 
 
-class DockerBundleTests(unittest.TestCase):
+class DockerServerTests(BridgeFixture):
     def setUp(self):
-        self.temp = tempfile.TemporaryDirectory()
-        self.addCleanup(self.temp.cleanup)
-        self.directory = Path(self.temp.name)
-        self.profile = json.loads((ROOT / "examples/services.token.windows.json").read_text())
-        self.profile["ssh"].update(host="192.0.2.10", port=21200)
-        self.config = self.directory / "services.json"
-        self.config.write_text(json.dumps(self.profile))
-        self.token = self.directory / "access.token"
-        self.secret = "Ab1Cd2E3"
-        self.token.write_text(self.secret + "\n")
-        self.token.chmod(0o600)
-        self.key = "ssh-ed25519 " + "A" * 32
-        self.output = self.directory / "downloads/client.zip"
-        self.args = bundle.parser().parse_args(["--config", str(self.config), "--token-file", str(self.token),
-                                               "--output", str(self.output)])
-        self.args.docker = "sudo docker"
-        self.receipt = {"user": "svc_tunnel_token1", "host_public_key": self.key, "token_active": True,
-                        "token_sha256": hashlib.sha256(self.secret.encode()).hexdigest()}
-        self.docker_calls = []
-        self.host_calls = []
-        self.staged = []
+        super().setUp()
+        self.state = self.directory / "state"
+        self.controller = container_server.Controller(self.profile, self.state, self.socket)
+        self.addCleanup(self.controller.close)
+        self.output = self.directory / "client.zip"
 
-    def host_prepare(self, command):
-        self.host_calls.append([str(value) for value in command])
-        self.assertIn("token-prepare", self.host_calls[-1])
-        self.assertNotIn(self.secret, str(command))
-        return json.dumps(self.receipt)
+    def start(self):
+        return self.controller.start()
 
-    def docker_run(self, command, *, cwd, env, check):
-        self.docker_calls.append(list(command))
-        self.assertEqual(command[:5], ["sudo", "docker", "compose", "--profile", "tools"])
-        self.assertNotIn(self.secret, str(command))
-        self.assertTrue(check)
-        self.assertEqual(env["BUILD_CLIENT"], "0" if self.args.source_only else "1")
-        if "run" not in command:
-            return subprocess.CompletedProcess(command, 0)
-        directory = Path(env["SSERVCLI_BUNDLE_INPUT"])
-        self.staged.append(directory)
-        self.assertEqual(set(p.name for p in directory.iterdir()), {"services.json", ".token"})
-        self.assertEqual(directory.stat().st_mode & 0o777, 0o700)
-        self.assertEqual((directory / ".token").stat().st_mode & 0o777, 0o600)
-        config = json.loads((directory / "services.json").read_text())
-        self.assertEqual(config["ssh"]["port"], 21200)
-        self.assertEqual(config["ssh"]["host_public_key"], self.key)
-        self.assertEqual(config["ssh"]["user"], "svc_tunnel_token1")
-        environment = {"BUNDLE_INPUT": str(directory), "BUNDLE_OUTPUT": str(self.output),
-                       "BUNDLE_UID": env["SSERVCLI_BUNDLE_UID"], "BUNDLE_GID": env["SSERVCLI_BUNDLE_GID"],
-                       "BUILD_CLIENT": env["BUILD_CLIENT"], "WINDOWS_ARCH": env["WINDOWS_ARCH"]}
-        # Execute the real container-side packager locally, substituting only
-        # prebuilt EXEs and ownership. Any attempted SSH provisioning is a bug.
+    def package(self, source=False):
+        environment = {"BUNDLE_UID": str(os.getuid()), "BUNDLE_GID": str(os.getgid()),
+                       "BUNDLE_OUTPUT": str(self.output), "BUILD_CLIENT": "0" if source else "1"}
         with (patch.dict(os.environ, environment, clear=True),
-              patch.object(bundle, "server_command", side_effect=AssertionError("Host SSH operations cannot run in the builder")),
               patch.object(bundle, "build_client", return_value={"sservcli.exe": b"MZclient", "sservcli-askpass.exe": b"MZaskpass"}),
-              patch.object(consumer.os, "chown") as owner):
-            consumer.package()
-        owner.assert_called_once_with(self.output, os.getuid(), os.getgid())
-        return subprocess.CompletedProcess(command, 0)
+              patch.object(bundle, "server_command", side_effect=AssertionError("The container cannot provision host accounts directly")),
+              patch.object(container_server.os, "chown") as owner):
+            output = container_server.package(self.config, self.state, self.socket)
+        owner.assert_called_once_with(output, os.getuid(), os.getgid())
+        return output
 
-    def run_pipeline(self):
-        with (patch.object(producer, "ROOT", self.directory),
-              patch.object(producer.subprocess, "run", side_effect=self.docker_run),
-              patch.object(bundle, "run", side_effect=self.host_prepare)):
-            return producer.package(self.args)
+    def test_container_lifetime_controls_existing_host_ssh(self):
+        self.start()
+        container_server.healthcheck(self.profile, self.state, self.socket)
+        token = read_private(self.state / "access.token").strip()
+        self.assertEqual(token, "Ab1Cd2E3")
+        self.assertEqual((self.state / "access.token").stat().st_mode & 0o777, 0o600)
+        metadata = read_private(self.state / "server.json")
+        self.assertNotIn(token, metadata)
+        self.assertEqual(json.loads(metadata)["ssh_port"], 21200)
+        self.controller.close()
+        self.wait_revoked()
+        self.assertFalse((self.state / "ready.json").exists())
+        with self.assertRaises(OSError):
+            container_server.healthcheck(self.profile, self.state, self.socket)
 
-    def test_host_port_key_and_active_token_survive_a_minimal_docker_zip(self):
-        self.run_pipeline()
-        self.assertEqual(len(self.host_calls), 1)
-        self.assertEqual(len(self.docker_calls), 2)
-        self.assertIn("build", self.docker_calls[0])
-        self.assertIn("run", self.docker_calls[1])
-        self.assertTrue(all(not directory.exists() for directory in self.staged))
-        self.assertEqual(json.loads(self.config.read_text()), self.profile)
-        self.assertEqual(self.token.read_text(), self.secret + "\n")
-        with zipfile.ZipFile(self.output) as archive:
+    def test_windows_zip_includes_current_token_existing_port_and_host_key(self):
+        self.start()
+        output = self.package()
+        self.assertEqual(output.stat().st_mode & 0o777, 0o600)
+        self.assertEqual(self.operations, ["token-serve", "token-prepare"])
+        self.assertEqual(load_profile(self.config), self.profile)
+        with zipfile.ZipFile(output) as archive:
             self.assertEqual(set(archive.namelist()), RUNTIME_FILES)
-            config = json.loads(archive.read("services.json"))
-            self.assertEqual(config["ssh"]["port"], 21200)
-            self.assertEqual(config["ssh"]["host_public_key"], self.key)
-            self.assertEqual(archive.read(".token").strip(), self.secret.encode())
+            ssh = json.loads(archive.read("services.json"))["ssh"]
+            self.assertEqual(ssh["port"], 21200)
+            self.assertEqual(ssh["user"], "svc_tunnel_token1")
+            self.assertEqual(ssh["host_public_key"], self.controller.lease.receipt["host_public_key"])
+            self.assertEqual(archive.read(".token").strip(), read_private(self.state / "access.token").strip().encode())
+            self.assertEqual((archive.getinfo(".token").external_attr >> 16) & 0o777, 0o600)
             for line in archive.read("SHA256SUMS.txt").decode().splitlines():
                 digest, name = line.split("  ", 1)
                 self.assertEqual(hashlib.sha256(archive.read(name)).hexdigest(), digest)
 
-    def test_inactive_host_token_never_reaches_the_packaging_container(self):
-        self.receipt["token_active"] = False
-        with self.assertRaisesRegex(bundle.BundleError, "matching active startup token"):
-            self.run_pipeline()
-        self.assertEqual(len(self.docker_calls), 1)
-        self.assertFalse(self.output.exists())
-        self.assertEqual(list((self.directory / "var").iterdir()), [])
-
-    def test_explicit_source_only_download_preserves_host_connection_settings(self):
-        self.args.source_only = True
-        self.run_pipeline()
-        with zipfile.ZipFile(self.output) as archive:
+    def test_source_only_still_includes_the_active_token(self):
+        self.start()
+        with zipfile.ZipFile(self.package(source=True)) as archive:
             self.assertIn("client/go.mod", archive.namelist())
             self.assertIn("Build.cmd", archive.namelist())
             self.assertNotIn("sservcli.exe", archive.namelist())
-            self.assertEqual(archive.read(".token").strip(), self.secret.encode())
+            self.assertEqual(archive.read(".token").strip(), b"Ab1Cd2E3")
             self.assertEqual(json.loads(archive.read("services.json"))["ssh"]["port"], 21200)
 
-    def test_missing_token_fails_before_any_docker_or_host_setup(self):
-        self.token.unlink()
-        with self.assertRaisesRegex(bundle.BundleError, "Cannot read current token"):
-            self.run_pipeline()
-        self.assertEqual(self.docker_calls, [])
-        self.assertEqual(self.host_calls, [])
-
-    def test_dry_run_needs_no_token_docker_or_sudo(self):
-        self.args.dry_run = True
-        self.token.unlink()
-        self.run_pipeline()
-        self.assertEqual(self.docker_calls, [])
-        self.assertEqual(self.host_calls, [])
+    def test_an_old_health_record_does_not_claim_an_active_server(self):
+        self.start()
+        ready = json.loads(read_private(self.state / "ready.json"))
+        ready["lease_id"] = "previous-lease"
+        write_private(self.state / "ready.json", json.dumps(ready))
+        with self.assertRaisesRegex(ConfigError, "no longer owns"):
+            self.package()
         self.assertFalse(self.output.exists())
 
-    def test_consumer_requires_a_pinned_host_profile_and_valid_owner(self):
-        source = self.directory / "input"
-        source.mkdir()
-        (source / "services.json").write_text(json.dumps(self.profile))
-        (source / ".token").write_text(self.secret)
-        env = {"BUNDLE_INPUT": str(source), "BUNDLE_UID": str(os.getuid()), "BUNDLE_GID": str(os.getgid())}
-        with patch.dict(os.environ, env, clear=True), self.assertRaisesRegex(bundle.BundleError, "pinned SSH host key"):
-            consumer.package()
-        env["BUNDLE_UID"] = "-1"
-        with patch.dict(os.environ, env, clear=True), self.assertRaisesRegex(bundle.BundleError, "host user"):
-            consumer.package()
+    def test_stale_token_is_rejected_before_publication(self):
+        self.start()
+        write_private(self.state / "access.token", "BadToken\n")
+        with self.assertRaisesRegex(ConfigError, "matching active startup token"):
+            self.package()
+        self.assertFalse(self.output.exists())
 
-    def test_consumer_rejects_linked_input_instead_of_reading_host_state(self):
-        source = self.directory / "input"
-        source.mkdir()
-        (source / "services.json").symlink_to(self.config)
-        with self.assertRaisesRegex(bundle.BundleError, "Invalid staged input"):
-            consumer.read_input(source / "services.json", 1024 * 1024)
+    def test_local_write_failure_revokes_the_host_lease(self):
+        with patch.object(container_server, "write_private", side_effect=OSError("fixture disk failure")):
+            with self.assertRaisesRegex(OSError, "fixture disk"):
+                self.start()
+        self.wait_revoked()
+        self.assertIsNone(self.controller.lock)
+        self.assertFalse((self.state / "ready.json").exists())
+
+    def test_another_controller_cannot_remove_the_live_readiness_record(self):
+        self.start()
+        other = container_server.Controller(self.profile, self.state, self.socket)
+        with self.assertRaisesRegex(ConfigError, "already in use"):
+            other.start()
+        other.close()
+        container_server.healthcheck(self.profile, self.state, self.socket)
+        self.controller.lease.heartbeat()
 
 
 class ComposeRoleTests(unittest.TestCase):
     @unittest.skipUnless(shutil.which("docker"), "Docker CLI required for Compose validation")
-    def test_compose_exposes_only_an_offline_builder_and_staged_inputs(self):
-        result = subprocess.run(["docker", "compose", "--profile", "tools", "config", "--format", "json"],
+    def test_custom_profile_and_build_options_survive_sudo_environment_filtering(self):
+        original = subprocess.run
+        expected = "/tmp/custom profile/office's services.json"
+        results, temporary_paths = [], []
+        def sudo_docker(command, **kwargs):
+            self.assertEqual(command[:2], ["sudo", "docker"])
+            path = Path(command[command.index("--env-file") + 1])
+            temporary_paths.append(path)
+            self.assertEqual(path.stat().st_mode & 0o777, 0o600)
+            self.assertEqual(path.parent.stat().st_mode & 0o777, 0o700)
+            self.assertNotIn("TOKEN", path.read_text())
+            # Simulate sudo removing the public interpolation variables.
+            environment = {key: value for key, value in kwargs["env"].items()
+                           if key not in ("CONFIG", "BUILD_CLIENT", "WINDOWS_ARCH", "SSERVCLI_BUNDLE_NAME")}
+            result = original(command[1:], cwd=kwargs["cwd"], env=environment, capture_output=True, text=True)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            results.append(json.loads(result.stdout)["services"]["server"])
+            return result
+        with (patch.dict(os.environ, {"CONFIG": expected, "WINDOWS_ARCH": "arm64", "BUILD_CLIENT": "0"}),
+              patch.object(docker_compose.subprocess, "run", side_effect=sudo_docker)):
+            self.assertEqual(docker_compose.run("sudo docker", ["config", "--format", "json"]), 0)
+        service = results[0]
+        profile = next(mount for mount in service["volumes"] if mount["target"] == "/config/services.json")
+        self.assertEqual(profile["source"], expected)
+        self.assertEqual(service["build"]["args"]["WINDOWS_ARCH"], "arm64")
+        self.assertEqual(service["build"]["args"]["BUILD_CLIENT"], "0")
+        self.assertTrue(all(not path.exists() for path in temporary_paths))
+
+    @unittest.skipUnless(shutil.which("docker"), "Docker CLI required for Compose validation")
+    def test_docker_runs_the_controller_with_only_a_fixed_host_ssh_socket(self):
+        result = subprocess.run(["docker", "compose", "config", "--format", "json"],
                                 cwd=ROOT, capture_output=True, text=True, check=True)
         services = json.loads(result.stdout)["services"]
-        self.assertEqual(set(services), {"builder"})
-        service = services["builder"]
+        self.assertEqual(set(services), {"server"})
+        service = services["server"]
         self.assertEqual(service["network_mode"], "none")
         self.assertTrue(service["read_only"])
+        self.assertEqual(service["restart"], "unless-stopped")
+        self.assertIn("healthcheck", service)
         self.assertNotIn("ports", service)
-        self.assertNotIn("healthcheck", service)
         self.assertNotIn("pid", service)
         self.assertFalse(service.get("privileged", False))
         mounts = {mount["target"]: mount for mount in service["volumes"]}
-        self.assertEqual(set(mounts), {"/input", "/output"})
-        self.assertTrue(mounts["/input"]["read_only"])
+        self.assertEqual(set(mounts), {"/config/services.json", "/host-ssh", "/state", "/dist"})
+        self.assertTrue(mounts["/config/services.json"]["read_only"])
+        self.assertTrue(mounts["/host-ssh"]["read_only"])
+        self.assertEqual(mounts["/host-ssh"]["source"], "/var/lib/sservcli/ssh-bridge/ipc")
         self.assertNotIn("HOST_KEY_FILE", service["environment"])
         self.assertNotIn("SSHD_CONFIG", service["environment"])
+        for mount in mounts.values():
+            self.assertNotIn(mount["source"], ("/etc/ssh", "/etc", "/var/run/docker.sock"))
 
 
 if __name__ == "__main__":

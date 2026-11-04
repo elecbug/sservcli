@@ -4,45 +4,42 @@ Forward several services through one verified **OpenSSH** connection. The client
 
 The server controller and account-provisioning tools remain Python 3.11+ standard-library programs. Transport still uses the existing system **`sshd`** and native **`ssh -L`**. Windows clients need OpenSSH Client, but neither Python nor Go is needed when the ZIP contains the compiled executables.
 
-## Existing host SSH with Docker client packaging
+## Docker server with the existing host SSH
 
-The SSH server, forwarding account, and token controller run on the **host**. The host's existing SSH port and host key are used. Docker builds the Windows client and packages the download in a short-lived container that opens no network listener.
+The **server application runs persistently in Docker**, controlling the token lifecycle and creating Windows downloads. Connections use the **host's existing sshd, port, and host key**. For example, `ssh.port: 21200` continues to use port 21200. Forwarded services remain reachable at the host's `127.0.0.1` because the host sshd opens their connections.
 
-The main profile defaults to **`var/services.windows.json`**. Its `ssh.port` is preserved, so a profile using port 21200 continues to use 21200. Account setup, token issuance, host-key validation, and SSH policy reloads all happen on the host. No host private keys, SSH configuration, account database, or server-state directory is mounted into the builder.
-
-If migrating from the previous standalone SSH container, remove it once:
+Use a Linux host with systemd, Python 3.11+, OpenSSH Server, Make, and rootful Docker with Compose. The main configuration is **`var/services.windows.json`**. Set its public/fallback addresses and service ports; keep `ssh.port` equal to the existing SSH endpoint. Go is supplied by the Docker build image.
 
 ```sh
-make DOCKER="sudo docker" docker-down
-```
-
-Start host token management and leave it running:
-
-```sh
-make server
-# Or choose a profile explicitly:
-# make server CONFIG=var/services.windows.json
-```
-
-In another terminal, create the Windows download:
-
-```sh
+make DOCKER="sudo docker" docker-up
 make DOCKER="sudo docker" docker-bundle
 ```
 
-If your account already has Docker access, omit `DOCKER="sudo docker"`. The host needs Python 3.11+ and OpenSSH; Go is supplied by the Docker build image. The image is built first, then the host validates the current token and prepares a final profile with the actual forwarding username and system SSH public key. Only that profile and `.token` enter the packaging container through a temporary read-only input directory. The network-disabled container writes the minimal ZIP to `dist/sservcli-windows-token.zip`, preserving earlier downloads with numeric suffixes and assigning the new private ZIP to the host user.
+`docker-up` builds the image and Windows executables, installs/updates a small root-owned host helper, and starts the Docker server in the background. It waits for the server to obtain a working token lease. No separate `make server` process is needed. If your account has Docker access, omit `DOCKER="sudo docker"`; installing the host helper still requires sudo.
 
-`var/server` holds host controller state and the current token. Stopping `make server` revokes that token and closes its forwarding sessions. Restarting it issues another token; rerun `make docker-bundle` or update the client's `.token`. The earlier `var/docker.env` listener settings and `var/docker-server` state are no longer used; those files can remain as backups.
+`docker-bundle` asks the running container to verify its current token against the host account and write **`dist/sservcli-windows-token.zip`**. The minimal download contains the two Windows EXEs, `services.json` with the existing host's public key and actual forwarding username, the current `.token`, start/stop scripts, a short guide, and checksums. Existing downloads receive numeric suffixes. The new ZIP belongs to the invoking host user and has mode 0600.
 
 ```sh
-make docker-build                   # Prepare the Windows builder image only
-make docker-up                      # Compatibility alias for docker-build
-make docker-bundle BUILD_CLIENT=0   # Source-only ZIP; compile later on Windows
+make DOCKER="sudo docker" docker-status
+make DOCKER="sudo docker" docker-logs
+make DOCKER="sudo docker" docker-down
 ```
 
-The builder service in `docker-compose.yaml` runs with `network_mode: none`, a read-only root filesystem, temporary scratch space, staged client input, and an output directory. It exits after packaging. `make docker-up` does not start an SSH daemon or a persistent application container; use `make server` for the host controller. `WINDOWS_ARCH=arm64` selects ARM64 Windows executables; AMD64 is the default.
+Stopping the container revokes its token and closes that dedicated account's forwarding sessions. An abrupt container exit also revokes access through Unix-socket EOF; a paused/unresponsive controller loses its lease after 60 seconds without a heartbeat. Starting or restarting the server issues a fresh token, so create another download with `docker-bundle`. `docker-up` recreates the server to apply configuration and helper updates; it also rotates the token. Host SSH and other SSH accounts continue operating.
 
-## Server on the host and Windows download
+The container communicates with **`sservcli-ssh-bridge.service`** through a private Unix socket. This host helper handles the account/password and SSH policy operations that must affect the host. At installation, it saves an approved account/port list and copies its code into root-owned storage at `/var/lib/sservcli/ssh-bridge`. Requests cannot supply arbitrary commands, files, users, or destination ports. Updating those settings requires rerunning `docker-up` with sudo authorization. The helper starts automatically on host reboot and cleans up stale token access on startup/shutdown. Inspect its errors with:
+
+```sh
+sudo journalctl -u sservcli-ssh-bridge.service -n 100
+```
+
+Compose runs a single server with a read-only root filesystem and `network_mode: none`: all TCP traffic belongs to the existing host sshd. It mounts the public profile and helper socket directory read-only, plus `var/container-server` for private token state and `dist` for downloads. No host private keys, SSH configuration, account database, or Docker socket are mounted. There is no additional SSH listener, port mapping, or subnet to configure. `var/container-server` is root-owned container state; native host mode uses the separate `var/server` directory.
+
+For migration, first stop any foreground `make server` process that owns the same account; its account lock intentionally prevents a second controller. Old `var/docker.env` and standalone-container state are unused. Removing old project containers with `docker-down` leaves host SSH running.
+
+`WINDOWS_ARCH=arm64` selects ARM64 executables; AMD64 is the default. For an explicit source-only download, start the image with `docker-up BUILD_CLIENT=0` and run `docker-bundle BUILD_CLIENT=0`. `docker-build` builds the image without installing the helper or starting the server. A custom `CONFIG` must also be supplied to `docker-bundle` so Compose resolves the same profile.
+
+## Optional native host server and Windows download
 
 On Ubuntu 24.04:
 
@@ -118,7 +115,7 @@ Useful commands:
 
 Launching the EXE without arguments starts the background client and opens management. It does not install a login task or system service. Runtime metadata, a process lock, and logs live in `.sservcli/` beside the executable; neither the control metadata nor logs contain the shared SSH token. Keep port 8000 available for management, or pass `--web-port` to `start`/`run`. SSH readiness does not prove that each remote application is healthy.
 
-After restarting `make server`, the old token stops working. Regenerate the ZIP with `make bundle`, or replace the client's `.token` with the new token and reconnect. The SSH host key does not change during token rotation.
+After restarting the server, the old token stops working. Regenerate the ZIP with `make docker-bundle` (Docker) or `make bundle` (native host), or replace the client's `.token` with the new token and reconnect. The SSH host key does not change during token rotation.
 
 ## Service configuration
 
@@ -171,7 +168,7 @@ Stopping the server controller locks its password and closes that account's exis
 
 Managed accounts are verified and reused. Existing unrelated users are preserved; a dedicated name such as `svc_tunnel_token1` is chosen instead. Migrating a managed key account preserves its UID/key files but disables public-key login for that token account. Retained managed destinations remain allowed. Its policy permits only local forwarding to configured loopback destinations, with `MaxSessions 0` and no shell, commands, SFTP, remote forwarding, agent/X11 forwarding, Unix-socket forwarding, or tunneling. Other accounts keep their existing authentication policy.
 
-The server token file is `SERVER_STATE/access.token`, default `var/server/access.token`; account records are under `/var/lib/sservcli`. Only the dedicated helper needs root and stays alive to revoke the token without another sudo prompt. The Python server has no third-party dependencies. Older Python client/desktop components have been removed.
+The native server token file is `SERVER_STATE/access.token`, default `var/server/access.token`. Docker uses `/state/access.token` inside the container, backed by root-owned `var/container-server/access.token` on the host. Account records are under `/var/lib/sservcli`. Host privilege helpers stay alive to revoke the token without another sudo prompt. The Python server has no third-party dependencies. Older Python client/desktop components have been removed.
 
 ## Build and package options
 
@@ -186,6 +183,7 @@ The server token file is `SERVER_STATE/access.token`, default `var/server/access
 | `DRY_RUN=1` | Preview bundling without compiling, provisioning, or creating a ZIP |
 | `SSHD_CONFIG` / `SSH_SERVICE` | Existing SSH configuration/service; defaults `/etc/ssh/sshd_config` / `ssh` |
 | `HOST_KEY_FILE` | Public key configured in system sshd; default `/etc/ssh/ssh_host_ed25519_key.pub` |
+| `SSERVCLI_BUNDLE_NAME` | Docker ZIP filename within `dist`; default `sservcli-windows-token.zip` |
 | `TOKEN_PORT` | Advertised SSH endpoint override; does not change the daemon's listening port |
 
 `make client-zip CONFIG=/path/to/final/services.json` repackages a final profile without server/account changes, using its adjacent `.token` or `BUNDLE_TOKEN_FILE`. It includes that supplied token without claiming to verify a live remote server. Use a profile whose public host key is already pinned. Version 1 key/Agent profiles remain supported; `make bundle LEGACY_SSH=1 PUBKEY_FILE=/path/client.pub CONFIG=legacy.json` retains the explicit public-key provisioning workflow and needs no `.token`.
@@ -201,6 +199,6 @@ sudo apt-get install libnss-wrapper openssl
 make integration
 ```
 
-Go tests cover strict JSON/token handling, forwarding arguments, port conflicts, log redaction, launch arguments, and local API access controls. Native SSH integration tests exercise the Go executable with key/Agent/password authentication, multiple services on one connection, fallback/reconnection, token rotation/locking, host-key failures, channel restrictions, large payloads, half-close, and background/web management. Provisioning and bundle tests mock privileged system mutations. Windows AMD64/ARM64 cross-compilation is checked; direct native Windows execution still needs validation on a Windows machine.
+Go tests cover strict JSON/token handling, forwarding arguments, port conflicts, log redaction, launch arguments, and local API access controls. Native SSH integration tests exercise the Go executable with key/Agent/password authentication, multiple services on one connection, fallback/reconnection, token rotation/locking, host-key failures, channel restrictions, large payloads, half-close, and background/web management. Provisioning tests mock privileged system mutations. Docker controller tests use real Unix sockets and child processes with a fake account helper to verify token revocation, approved scopes, and minimal downloads without changing host accounts. Windows AMD64/ARM64 cross-compilation is checked; direct native Windows execution still needs validation on a Windows machine.
 
 For Linux, keep `.token` and private runtime files at mode 0600 and `.sservcli/` at 0700 (`chmod 600 .token` after extracting if needed). A missing or rejected token leaves management available so the file can be corrected and reloaded. Check `.sservcli/client.log` for failures. If a server policy audit reports an earlier `Match`/`Include` conflict, fix that SSH policy before retrying; the installer rolls back failed policy updates.

@@ -1,33 +1,46 @@
 services:
-  builder:
-    image: sservcli-builder:local
-    profiles: [tools]
+  server:
+    image: sservcli-server:local
     build:
       context: .
-      target: bundle
+      target: server
       args:
         WINDOWS_ARCH: ${WINDOWS_ARCH:-amd64}
         BUILD_CLIENT: ${BUILD_CLIENT:-1}
+    # The host sshd carries all TCP traffic. Only local Unix IPC is needed here.
     network_mode: none
     read_only: true
     init: true
+    restart: unless-stopped
+    stop_grace_period: 45s
     environment:
       BUILD_CLIENT: ${BUILD_CLIENT:-1}
       WINDOWS_ARCH: ${WINDOWS_ARCH:-amd64}
-      CLIENT_BINARIES: /opt/sservcli-client
-      BUNDLE_INPUT: /input
-      BUNDLE_OUTPUT: /output/${SSERVCLI_BUNDLE_NAME:-sservcli-windows-token.zip}
-      BUNDLE_UID: ${SSERVCLI_BUNDLE_UID:-1000}
-      BUNDLE_GID: ${SSERVCLI_BUNDLE_GID:-1000}
+      BUNDLE_OUTPUT: /dist/${SSERVCLI_BUNDLE_NAME:-sservcli-windows-token.zip}
     volumes:
       - type: bind
-        source: ${SSERVCLI_BUNDLE_INPUT:-./var/.bundle-input}
-        target: /input
+        source: ${CONFIG:-./var/services.windows.json}
+        target: /config/services.json
         read_only: true
         bind:
           create_host_path: false
       - type: bind
-        source: ${SSERVCLI_BUNDLE_OUTPUT:-./dist}
-        target: /output
+        source: /var/lib/sservcli/ssh-bridge/ipc
+        target: /host-ssh
+        read_only: true
+        bind:
+          create_host_path: false
+      - type: bind
+        source: ./var/container-server
+        target: /state
+      - type: bind
+        source: ./dist
+        target: /dist
     tmpfs:
       - /tmp
+    healthcheck:
+      test: [CMD, python3, /opt/sservcli/server/container_server.py, healthcheck]
+      interval: 5s
+      timeout: 4s
+      start_period: 10s
+      retries: 5

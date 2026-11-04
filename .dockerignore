@@ -11,10 +11,10 @@
 !sservcli/
 !sservcli/*.py
 !server/
-!server/*.py
+!server/sservcli_server.py
+!server/container_server.py
 !tools/
 !tools/bundle_windows.py
-!tools/container_bundle.py
 !examples/
 !examples/services.token.json
 !examples/services.token.windows.json
