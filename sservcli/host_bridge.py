@@ -3,7 +3,7 @@ import json
 from pathlib import Path
 import socket
 
-from .config import ConfigError, token_profile
+from .config import ConfigError, token_profile, validate_token
 
 MAX_MESSAGE = 32768
 
@@ -77,15 +77,20 @@ def request(path, operation, config):
 
 
 class Lease:
-    def __init__(self, path, config):
+    def __init__(self, path, config, *, reuse_token=None, no_reset_token=False):
         self.path, self.config = Path(path), config
         self.peer = None
         self.receipt = self.lease_id = None
+        self.reuse_token = validate_token(reuse_token) if reuse_token is not None else None
+        self.no_reset_token = no_reset_token or reuse_token is not None
 
     def start(self):
         self.peer = connect(self.path)
         try:
-            self.peer.send({"operation": "lease", "scope": scope(self.config)})
+            message = {"operation": "lease", "scope": scope(self.config)}
+            if self.no_reset_token:
+                message["reuse_token"] = self.reuse_token
+            self.peer.send(message)
             message = response(self.peer)
             self.receipt, self.lease_id = message["receipt"], message["lease_id"]
             if not isinstance(self.receipt, dict) or not isinstance(self.lease_id, str):

@@ -4,6 +4,7 @@ import argparse
 import contextlib
 import fcntl
 import hashlib
+import hmac
 import json
 import os
 from pathlib import Path
@@ -642,6 +643,19 @@ def host_public_key(path, provisioner=None):
 def token_command(args, provisioner, preferred, permitted):
     account_lock = None
     ready = None
+    reuse_token = None
+    if getattr(args, "reuse_token_stdin", False):
+        # This stdin is the private lifetime pipe from the approved host bridge.
+        line = sys.stdin.readline(257)
+        try:
+            message = json.loads(line)
+        except ValueError as error:
+            raise SetupError("Invalid saved-token request") from error
+        if (args.command != "token-serve" or len(line) > 256 or not line.endswith("\n")
+                or not isinstance(message, dict) or set(message) != {"token"}
+                or not isinstance(message["token"], str) or not re.fullmatch(r"[A-Za-z0-9]{8}", message["token"])):
+            raise SetupError("Invalid saved-token request")
+        reuse_token = message["token"]
     try:
         with management_lock():
             if args.ensure_ssh:
@@ -654,16 +668,30 @@ def token_command(args, provisioner, preferred, permitted):
                     fcntl.flock(account_lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
                 except BlockingIOError as error:
                     raise SetupError("A token controller is already running for this SSH account") from error
+            if reuse_token is not None:
+                record, _, _ = provisioner.managed_identity(user)
+                previous = record.get("last_token_sha256")
+                if (record.get("auth_mode") != "token" or not isinstance(previous, str)
+                        or not hmac.compare_digest(previous, hashlib.sha256(reuse_token.encode()).hexdigest())):
+                    raise SetupError("Saved token does not match this managed SSH account; retry without NO_RESET_TOKEN to issue a new token")
+            elif getattr(args, "no_reset_token", False) and account(user):
+                record, _, _ = provisioner.managed_identity(user)
+                if record.get("last_token_sha256"):
+                    raise SetupError("A previous token exists but the saved token file is missing; restore /state/access.token or retry without NO_RESET_TOKEN")
             receipt = provisioner.ensure_token(user, permitted)
             if account_lock:
                 ready = receipt
                 record = json.loads(provisioner.state_path(user).read_text())
                 alphabet = string.ascii_letters + string.digits
-                while True:
-                    token = "".join(secrets.choice(alphabet) for _ in range(8))
+                if reuse_token is not None:
+                    token = reuse_token
                     digest = hashlib.sha256(token.encode()).hexdigest()
-                    if digest != record.get("last_token_sha256"):
-                        break
+                else:
+                    while True:
+                        token = "".join(secrets.choice(alphabet) for _ in range(8))
+                        digest = hashlib.sha256(token.encode()).hexdigest()
+                        if digest != record.get("last_token_sha256"):
+                            break
                 provisioner.set_token(user, token)
                 # Password rotation does not terminate authenticated transports.
                 result = run(["pkill", "-KILL", "-u", str(receipt["uid"])], check=False)
@@ -671,7 +699,7 @@ def token_command(args, provisioner, preferred, permitted):
                     raise SetupError("Could not close previous token forwarding sessions")
                 record["last_token_sha256"] = digest
                 atomic_write(provisioner.state_path(user), json.dumps(record, indent=2) + "\n")
-                receipt["token"] = token
+                receipt.update(token=token, token_reused=reuse_token is not None)
             if not account_lock:
                 record = json.loads(provisioner.state_path(user).read_text())
                 active = False
@@ -714,6 +742,9 @@ def parser():
             sub.add_argument("--ensure-ssh", action="store_true", help="Generate missing host keys and enable/start the SSH service before installing")
         if command in ("token-prepare", "token-serve"):
             sub.add_argument("--host-key", default="/etc/ssh/ssh_host_ed25519_key.pub")
+        if command == "token-serve":
+            sub.add_argument("--reuse-token-stdin", action="store_true", help="Read a saved token from the private control pipe and verify its managed hash")
+            sub.add_argument("--no-reset-token", action="store_true", help="Refuse to rotate an existing token if its private saved value is unavailable")
         if command != "render":
             sub.add_argument("--sshd-config", default="/etc/ssh/sshd_config")
             sub.add_argument("--ssh-service", default="ssh")

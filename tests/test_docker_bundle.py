@@ -5,6 +5,8 @@ import os
 from pathlib import Path
 import shutil
 import subprocess
+import sys
+import tempfile
 import unittest
 from unittest.mock import patch
 import zipfile
@@ -118,8 +120,100 @@ class DockerServerTests(BridgeFixture):
         container_server.healthcheck(self.profile, self.state, self.socket)
         self.controller.lease.heartbeat()
 
+    def restart(self, *, preserve=False):
+        self.controller.close()
+        self.controller = container_server.Controller(self.profile, self.state, self.socket, no_reset_token=preserve)
+        self.addCleanup(self.controller.close)
+        self.controller.start()
+
+    def test_no_reset_preserves_the_token_and_new_bundle_across_restarts(self):
+        self.start()
+        token = read_private(self.state / "access.token")
+        self.restart(preserve=True)
+        self.assertEqual(read_private(self.state / "access.token"), token)
+        self.assertTrue(self.controller.lease.receipt["token_reused"])
+        container_server.healthcheck(self.profile, self.state, self.socket)
+        with zipfile.ZipFile(self.package()) as archive:
+            self.assertEqual(archive.read(".token"), token.encode())
+        self.controller.close()
+        self.wait_revoked()
+
+    def test_no_reset_on_first_start_issues_a_new_token(self):
+        self.controller.no_reset_token = True
+        self.start()
+        self.assertFalse(self.controller.lease.receipt["token_reused"])
+        self.assertEqual(read_private(self.state / "access.token").strip(), "Ab1Cd2E3")
+
+    def test_default_restart_still_rotates_the_token(self):
+        self.start()
+        previous = read_private(self.state / "access.token")
+        self.restart()
+        self.assertNotEqual(read_private(self.state / "access.token"), previous)
+        self.assertFalse(self.controller.lease.receipt["token_reused"])
+
+    def test_docker_bundle_replaces_the_previous_zip_with_the_current_token(self):
+        self.start()
+        first = self.package()
+        with zipfile.ZipFile(first) as archive:
+            previous = archive.read(".token")
+        self.restart()
+        self.assertEqual(self.package(), first)
+        with zipfile.ZipFile(first) as archive:
+            self.assertEqual(set(archive.namelist()), RUNTIME_FILES)
+            self.assertNotEqual(archive.read(".token"), previous)
+            self.assertEqual(archive.read(".token").decode(), read_private(self.state / "access.token"))
+        self.assertEqual(first.stat().st_mode & 0o777, 0o600)
+        self.assertEqual(list(self.directory.glob("client-*.zip")), [])
+
+    def test_corrupt_saved_token_is_not_silently_rotated(self):
+        self.start()
+        self.controller.close()
+        write_private(self.state / "access.token", "broken\n")
+        with self.assertRaisesRegex(ConfigError, "8-character token"):
+            self.restart(preserve=True)
+        self.assertEqual(read_private(self.state / "access.token"), "broken\n")
+        self.assertEqual(self.operations, ["token-serve"])
+
+    def test_mismatched_saved_token_is_not_silently_rotated(self):
+        self.start()
+        self.controller.close()
+        write_private(self.state / "access.token", "BadToken\n")
+        with self.assertRaisesRegex(ConfigError, "Host SSH helper failed"):
+            self.restart(preserve=True)
+        self.assertEqual(read_private(self.state / "access.token"), "BadToken\n")
+        self.assertEqual((self.directory / "issued.token").read_text(), "Ab1Cd2E3")
+
+    def test_missing_saved_token_does_not_rotate_an_existing_host_token(self):
+        self.start()
+        self.controller.close()
+        (self.state / "access.token").unlink()
+        with self.assertRaisesRegex(ConfigError, "Host SSH helper failed"):
+            self.restart(preserve=True)
+        self.assertFalse((self.state / "access.token").exists())
+        self.assertEqual((self.directory / "issued.token").read_text(), "Ab1Cd2E3")
+
 
 class ComposeRoleTests(unittest.TestCase):
+    def test_up_stops_the_old_controller_before_reinstalling_the_helper(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            directory = Path(temporary)
+            log = directory / "events"
+            docker = directory / "docker.py"
+            docker.write_text("import os, pathlib, sys\n"
+                              "operation = next(arg for arg in sys.argv[1:] if arg in ('config', 'build', 'stop', 'up', 'logs'))\n"
+                              "with pathlib.Path(os.environ['SSERVCLI_TEST_EVENTS']).open('a') as out: out.write(operation + '\\n')\n")
+            python = directory / "python"
+            python.write_text(f"#!{sys.executable}\nimport os, pathlib, subprocess, sys\n"
+                              "if sys.argv[1] == 'server/ssh_bridge.py':\n"
+                              "    with pathlib.Path(os.environ['SSERVCLI_TEST_EVENTS']).open('a') as out: out.write('install\\n')\n"
+                              "else:\n"
+                              "    sys.exit(subprocess.run([sys.executable, *sys.argv[1:]]).returncode)\n")
+            python.chmod(0o700)
+            subprocess.run(["make", "-s", "--no-print-directory", "docker-up", "NO_RESET_TOKEN=1",
+                            f"RUN_PYTHON={python}", f"DOCKER={sys.executable} {docker}"], cwd=ROOT,
+                           env={**os.environ, "SSERVCLI_TEST_EVENTS": str(log)}, capture_output=True, text=True, check=True)
+            self.assertEqual(log.read_text().splitlines(), ["config", "build", "stop", "install", "up"])
+
     @unittest.skipUnless(shutil.which("docker"), "Docker CLI required for Compose validation")
     def test_custom_profile_and_build_options_survive_sudo_environment_filtering(self):
         original = subprocess.run
@@ -131,15 +225,16 @@ class ComposeRoleTests(unittest.TestCase):
             temporary_paths.append(path)
             self.assertEqual(path.stat().st_mode & 0o777, 0o600)
             self.assertEqual(path.parent.stat().st_mode & 0o777, 0o700)
-            self.assertNotIn("TOKEN", path.read_text())
+            self.assertEqual({line.split("=", 1)[0] for line in path.read_text().splitlines()},
+                             {"CONFIG", "BUILD_CLIENT", "WINDOWS_ARCH", "SSERVCLI_BUNDLE_NAME", "NO_RESET_TOKEN"})
             # Simulate sudo removing the public interpolation variables.
             environment = {key: value for key, value in kwargs["env"].items()
-                           if key not in ("CONFIG", "BUILD_CLIENT", "WINDOWS_ARCH", "SSERVCLI_BUNDLE_NAME")}
+                           if key not in ("CONFIG", "BUILD_CLIENT", "WINDOWS_ARCH", "SSERVCLI_BUNDLE_NAME", "NO_RESET_TOKEN")}
             result = original(command[1:], cwd=kwargs["cwd"], env=environment, capture_output=True, text=True)
             self.assertEqual(result.returncode, 0, result.stderr)
             results.append(json.loads(result.stdout)["services"]["server"])
             return result
-        with (patch.dict(os.environ, {"CONFIG": expected, "WINDOWS_ARCH": "arm64", "BUILD_CLIENT": "0"}),
+        with (patch.dict(os.environ, {"CONFIG": expected, "WINDOWS_ARCH": "arm64", "BUILD_CLIENT": "0", "NO_RESET_TOKEN": "1"}),
               patch.object(docker_compose.subprocess, "run", side_effect=sudo_docker)):
             self.assertEqual(docker_compose.run("sudo docker", ["config", "--format", "json"]), 0)
         service = results[0]
@@ -147,6 +242,7 @@ class ComposeRoleTests(unittest.TestCase):
         self.assertEqual(profile["source"], expected)
         self.assertEqual(service["build"]["args"]["WINDOWS_ARCH"], "arm64")
         self.assertEqual(service["build"]["args"]["BUILD_CLIENT"], "0")
+        self.assertEqual(service["environment"]["NO_RESET_TOKEN"], "1")
         self.assertTrue(all(not path.exists() for path in temporary_paths))
 
     @unittest.skipUnless(shutil.which("docker"), "Docker CLI required for Compose validation")
@@ -172,6 +268,18 @@ class ComposeRoleTests(unittest.TestCase):
         self.assertNotIn("SSHD_CONFIG", service["environment"])
         for mount in mounts.values():
             self.assertNotIn(mount["source"], ("/etc/ssh", "/etc", "/var/run/docker.sock"))
+
+    def test_make_accepts_both_preserve_token_spellings(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            fake = Path(temporary) / "docker.py"
+            fake.write_text("import pathlib, sys\npath = pathlib.Path(sys.argv[sys.argv.index('--env-file') + 1])\n"
+                            "print(next(line for line in path.read_text().splitlines() if line.startswith('NO_RESET_TOKEN=')))\n")
+            for options, expected in (([], "0"), (["NO_RESET_TOKEN=1"], "1"), (["NO_RESET_TOKEN"], "1")):
+                with self.subTest(options=options):
+                    result = subprocess.run(["make", "-s", "--no-print-directory", "docker-config", *options,
+                                             f"DOCKER={sys.executable} {fake}"], cwd=ROOT, text=True, capture_output=True,
+                                            env={**os.environ, "NO_RESET_TOKEN": "0"}, check=True)
+                    self.assertEqual(result.stdout.strip(), f"NO_RESET_TOKEN='{expected}'")
 
 
 if __name__ == "__main__":

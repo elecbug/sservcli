@@ -21,17 +21,29 @@ from sservcli.host_bridge import Lease, connect, request, response, scope
 ROOT = Path(__file__).resolve().parents[1]
 FAKE_HELPER = r'''
 import hashlib, json, pathlib, signal, sys
-operation, directory = sys.argv[1:]
+operation, directory, reusing = sys.argv[1:]
 directory = pathlib.Path(directory)
 profile = json.loads((directory / "profile.json").read_text())
 receipt = {"user": "svc_tunnel_token1", "requested_user": profile["ssh"]["user"],
            "host_public_key": "ssh-ed25519 " + "A" * 32,
            "permitted": ["127.0.0.1:" + str(s["remote_port"]) for s in profile["services"]]}
 active = directory / "active"
-token = "Ab1Cd2E3"
+saved = directory / "issued.token"
+previous = saved.read_text() if saved.exists() else None
+token = previous or "Ab1Cd2E3"
 if operation == "token-serve":
+    if reusing == "1":
+        token = json.loads(sys.stdin.readline())["token"]
+        if token != previous:
+            raise SystemExit("Saved token does not match fixture account")
+    else:
+        if reusing == "missing" and previous:
+            raise SystemExit("Saved token is missing for the fixture account")
+        token = "Z9y8X7w6" if previous == "Ab1Cd2E3" else "Ab1Cd2E3"
+    saved.write_text(token)
+    saved.chmod(0o600)
     active.write_text("yes")
-    receipt["token"] = token
+    receipt.update(token=token, token_reused=reusing == "1")
     def stop(*_):
         raise SystemExit(0)
     signal.signal(signal.SIGTERM, stop)
@@ -57,9 +69,10 @@ class BridgeFixture(unittest.TestCase):
         self.config = self.directory / "profile.json"
         self.config.write_text(json.dumps(self.profile))
         self.operations = []
-        def factory(operation):
+        def factory(operation, reuse_token=None, *, no_reset_token=False):
             self.operations.append(operation)
-            return subprocess.Popen([sys.executable, "-c", FAKE_HELPER, operation, str(self.directory)],
+            mode = "1" if reuse_token else "missing" if no_reset_token else "0"
+            return subprocess.Popen([sys.executable, "-c", FAKE_HELPER, operation, str(self.directory), mode],
                                     stdin=subprocess.PIPE, stdout=subprocess.PIPE, text=True)
         self.socket = self.directory / "bridge.sock"
         self.server = ssh_bridge.BridgeServer(self.socket, {"profile": self.profile}, self.directory, factory=factory)
@@ -148,6 +161,28 @@ class HostBridgeTests(BridgeFixture):
         self.lease()
         self.server.close_clients()
         self.wait_revoked()
+
+    def test_token_reuse_never_places_the_credential_in_helper_arguments(self):
+        self.server.factory = None
+        self.server.snapshot.update(sshd_config="/etc/ssh/sshd_config", ssh_service="ssh",
+                                    host_key="/etc/ssh/ssh_host_ed25519_key.pub")
+        with patch.object(ssh_bridge.subprocess, "Popen") as start:
+            self.server.helper("token-serve", "Ab1Cd2E3")
+        command = start.call_args.args[0]
+        self.assertIn("--reuse-token-stdin", command)
+        self.assertNotIn("Ab1Cd2E3", str(command))
+
+    def test_reuse_requests_cannot_extend_the_approved_scope(self):
+        peer = connect(self.socket)
+        try:
+            different = scope(self.profile)
+            different["destinations"] = ["127.0.0.1:1"]
+            peer.send({"operation": "lease", "scope": different, "reuse_token": "Ab1Cd2E3"})
+            with self.assertRaisesRegex(ConfigError, "approved host profile"):
+                response(peer)
+        finally:
+            peer.close()
+        self.assertEqual(self.operations, [])
 
 
 class InstallTests(unittest.TestCase):

@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Docker token controller; SSH transport remains in the host's existing sshd."""
 import argparse
+import hmac
 import json
 import os
 from pathlib import Path
@@ -29,10 +30,11 @@ def container_state(path):
 
 
 class Controller:
-    def __init__(self, config, state, bridge):
+    def __init__(self, config, state, bridge, *, no_reset_token=False):
         self.profile = token_profile(config)
         self.state, self.bridge = container_state(state), Path(bridge)
         self.lease = self.lock = None
+        self.no_reset_token = no_reset_token
 
     def start(self):
         lock = FileLock(self.state / "controller.lock")
@@ -40,13 +42,19 @@ class Controller:
         self.lock = lock
         try:
             (self.state / "ready.json").unlink(missing_ok=True)
-            self.lease = Lease(self.bridge, self.profile).start()
+            existing = None
+            token_path = self.state / "access.token"
+            if self.no_reset_token and os.path.lexists(token_path):
+                existing = validate_token(read_private(token_path).rstrip("\r\n"))
+            self.lease = Lease(self.bridge, self.profile, reuse_token=existing, no_reset_token=self.no_reset_token).start()
             receipt = self.lease.receipt
             if (receipt.get("requested_user") != self.profile["ssh"]["user"]
                     or not isinstance(receipt.get("user"), str)
                     or not isinstance(receipt.get("host_public_key"), str)):
                 raise ConfigError("Invalid host SSH setup response")
             token = validate_token(receipt.get("token"))
+            if existing is not None and (not hmac.compare_digest(token, existing) or receipt.get("token_reused") is not True):
+                raise ConfigError("The host did not preserve the saved token; private token state was not overwritten")
             final = token_profile(self.profile)
             final["ssh"].update(user=receipt["user"], host_public_key=receipt["host_public_key"])
             validate_profile(final)
@@ -83,13 +91,14 @@ def healthcheck(config, state, bridge):
         raise ConfigError("The Docker server no longer owns the host SSH token")
 
 
-def serve(config, state, bridge):
+def serve(config, state, bridge, *, no_reset_token=False):
     stopping = threading.Event()
     previous = {number: signal.signal(number, lambda *_: stopping.set()) for number in (signal.SIGTERM, signal.SIGINT)}
-    controller = Controller(config, state, bridge)
+    controller = Controller(config, state, bridge, no_reset_token=no_reset_token)
     try:
         controller.start()
-        print(f"Docker server ready; using existing host SSH port {controller.profile['ssh']['port']}. Token saved privately in /state/access.token.", flush=True)
+        action = "Reused saved token" if controller.lease.receipt.get("token_reused") else "Issued new token"
+        print(f"Docker server ready; using existing host SSH port {controller.profile['ssh']['port']}. {action}; saved privately in /state/access.token.", flush=True)
         while not stopping.wait(5):
             controller.lease.heartbeat()
     finally:
@@ -117,10 +126,14 @@ def package(config, state, bridge):
 
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
+    if os.environ.get("NO_RESET_TOKEN", "0") not in ("0", "1"):
+        parser.error("NO_RESET_TOKEN must be 0 or 1")
     parser.add_argument("command", choices=("serve", "healthcheck", "bundle"))
     parser.add_argument("--config", type=Path, default=Path(os.environ.get("CONFIG") or "/config/services.json"))
     parser.add_argument("--state-dir", type=Path, default=Path(os.environ.get("SERVER_STATE") or "/state"))
     parser.add_argument("--bridge-socket", type=Path, default=Path(os.environ.get("SSERVCLI_BRIDGE_SOCKET") or "/host-ssh/bridge.sock"))
+    parser.add_argument("--no-reset-token", action="store_true", default=os.environ.get("NO_RESET_TOKEN") == "1",
+                        help="Reuse the private saved token when it matches the managed SSH account")
     args = parser.parse_args(argv)
     try:
         if args.command == "bundle":
@@ -128,7 +141,7 @@ def main(argv=None):
         else:
             config = load_profile(args.config)
             if args.command == "serve":
-                serve(config, args.state_dir, args.bridge_socket)
+                serve(config, args.state_dir, args.bridge_socket, no_reset_token=args.no_reset_token)
             else:
                 healthcheck(config, args.state_dir, args.bridge_socket)
         return 0

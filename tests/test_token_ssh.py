@@ -220,6 +220,20 @@ class NativeTokenSshTests(unittest.TestCase):
         self.connect(expected='failed')
         self.assertNotIn('Accepted password', self.log_path.read_text())
 
+    def test_reactivating_saved_password_preserves_existing_client_credentials(self):
+        self.connect()
+        self.roundtrip()
+        self.tunnel.disconnect()
+        self.set_password(locked=True)
+        self.connect(expected='failed')
+        self.tunnel.disconnect()
+        # The Docker preservation path sets the verified saved password again
+        # after lease revocation. The client's token file remains identical.
+        self.set_password(self.secret)
+        self.connect()
+        for index in range(3):
+            self.roundtrip(index)
+
     def test_strict_host_verification_stops_before_password_authentication(self):
         self.profile['ssh']['host_public_key'] = (self.directory / 'wrong_host.pub').read_text().strip()
         state = self.connect(expected='failed')

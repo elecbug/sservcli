@@ -8,6 +8,7 @@ import tempfile
 import io
 import contextlib
 import builtins
+import hashlib
 from types import SimpleNamespace
 import unittest
 from unittest.mock import patch
@@ -435,9 +436,82 @@ class TransactionTests(unittest.TestCase):
             server.token_command(args, self.p, "svc_tunnel", ["127.0.0.1:8080"])
         receipt = json.loads(output.getvalue())
         self.assertRegex(receipt["token"], r"\A[A-Za-z0-9]{8}\Z")
+        self.assertFalse(receipt["token_reused"])
         password.assert_called_once_with("svc_tunnel", receipt["token"])
         self.assertEqual(self.commands[-2:], [["usermod", "--lock", "svc_tunnel"], ["pkill", "-KILL", "-u", str(receipt["uid"])]])
         self.assertNotIn(receipt["token"], self.p.state_path("svc_tunnel").read_text())
+
+    def saved_token_account(self):
+        self.p.ensure_token("svc_tunnel", ["127.0.0.1:8080"])
+        token = "Ab1Cd2E3"
+        path = self.p.state_path("svc_tunnel")
+        record = json.loads(path.read_text())
+        record["last_token_sha256"] = hashlib.sha256(token.encode()).hexdigest()
+        path.write_text(json.dumps(record))
+        return token
+
+    def test_reusing_the_saved_token_reactivates_the_same_password_and_digest(self):
+        token = self.saved_token_account()
+        args = SimpleNamespace(command="token-serve", ensure_ssh=False, host_key="ignored.pub", reuse_token_stdin=True)
+        output = io.StringIO()
+        lock_path = self.p.home_base.parent / "token-reuse.lock"
+        with (patch.object(server, "management_lock", side_effect=contextlib.nullcontext),
+              patch.object(server, "host_public_key", return_value="ssh-ed25519 public"),
+              patch.object(server, "open", side_effect=lambda *a, **kw: builtins.open(lock_path, "a"), create=True),
+              patch.object(server.sys, "stdin", io.StringIO(json.dumps({"token": token}) + "\n")),
+              patch.object(server.secrets, "choice", side_effect=AssertionError("Token reuse must not generate a new token")),
+              patch.object(self.p, "set_token") as password, contextlib.redirect_stdout(output)):
+            server.token_command(args, self.p, "svc_tunnel", ["127.0.0.1:8080"])
+        receipt = json.loads(output.getvalue())
+        self.assertTrue(receipt["token_reused"])
+        self.assertEqual(receipt["token"], token)
+        password.assert_called_once_with("svc_tunnel", token)
+        record = json.loads(self.p.state_path("svc_tunnel").read_text())
+        self.assertEqual(record["last_token_sha256"], hashlib.sha256(token.encode()).hexdigest())
+        self.assertNotIn(token, json.dumps(record))
+        self.assertFalse(any(token in str(command) for command in self.commands))
+        self.assertEqual(self.commands[-2][0:2], ["usermod", "--lock"])
+
+    def test_a_mismatched_saved_token_cannot_change_the_account(self):
+        self.saved_token_account()
+        original = self.p.state_path("svc_tunnel").read_text()
+        args = SimpleNamespace(command="token-serve", ensure_ssh=False, host_key="ignored.pub", reuse_token_stdin=True)
+        lock_path = self.p.home_base.parent / "token-reuse.lock"
+        with (patch.object(server, "management_lock", side_effect=contextlib.nullcontext),
+              patch.object(server, "host_public_key", return_value="ssh-ed25519 public"),
+              patch.object(server, "open", side_effect=lambda *a, **kw: builtins.open(lock_path, "a"), create=True),
+              patch.object(server.sys, "stdin", io.StringIO('{"token":"BadToken"}\n')),
+              patch.object(self.p, "ensure_token") as prepare, patch.object(self.p, "set_token") as password,
+              patch.object(self.p, "lock_token") as revoke, self.assertRaisesRegex(server.SetupError, "Saved token does not match")):
+            server.token_command(args, self.p, "svc_tunnel", ["127.0.0.1:8080"])
+        prepare.assert_not_called()
+        password.assert_not_called()
+        revoke.assert_not_called()
+        self.assertEqual(self.p.state_path("svc_tunnel").read_text(), original)
+
+    def test_invalid_saved_token_messages_are_rejected_before_account_setup(self):
+        args = SimpleNamespace(command="token-serve", ensure_ssh=False, host_key="ignored.pub", reuse_token_stdin=True)
+        for message in ('{"token":"short"}\n', '{"token":"Ab1Cd2E3","command":"anything"}\n', 'not json\n'):
+            with (self.subTest(message=message), patch.object(server.sys, "stdin", io.StringIO(message)),
+                  patch.object(self.p, "ensure_token") as prepare, self.assertRaisesRegex(server.SetupError, "Invalid saved-token")):
+                server.token_command(args, self.p, "svc_tunnel", ["127.0.0.1:8080"])
+            prepare.assert_not_called()
+        self.assertEqual(self.commands, [])
+
+    def test_preservation_without_a_saved_value_never_rotates_an_existing_token(self):
+        self.saved_token_account()
+        original = self.p.state_path("svc_tunnel").read_text()
+        args = SimpleNamespace(command="token-serve", ensure_ssh=False, host_key="ignored.pub", no_reset_token=True)
+        lock_path = self.p.home_base.parent / "token-reuse.lock"
+        with (patch.object(server, "management_lock", side_effect=contextlib.nullcontext),
+              patch.object(server, "host_public_key", return_value="ssh-ed25519 public"),
+              patch.object(server, "open", side_effect=lambda *a, **kw: builtins.open(lock_path, "a"), create=True),
+              patch.object(self.p, "ensure_token") as prepare, patch.object(self.p, "set_token") as password,
+              self.assertRaisesRegex(server.SetupError, "saved token file is missing")):
+            server.token_command(args, self.p, "svc_tunnel", ["127.0.0.1:8080"])
+        prepare.assert_not_called()
+        password.assert_not_called()
+        self.assertEqual(self.p.state_path("svc_tunnel").read_text(), original)
 
     def test_bundle_receipt_checks_live_token_lease_without_issuing_a_token(self):
         self.p.ensure_token("svc_tunnel", ["127.0.0.1:8080"])

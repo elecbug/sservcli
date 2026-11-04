@@ -17,16 +17,20 @@ SERVER_STATE ?= var/server
 GO ?= go
 TOKEN_FILE ?= .token
 BUILD_CLIENT ?= 1
+NO_RESET_TOKEN ?= 0
+ifneq ($(filter NO_RESET_TOKEN,$(MAKECMDGOALS)),)
+override NO_RESET_TOKEN := 1
+endif
 WINDOWS_ARCH ?= amd64
 DOCKER ?= docker
 COMPOSE = "$(RUN_PYTHON)" tools/docker_compose.py --docker "$(DOCKER)" --
 
 export TUNNEL_USER PUBKEY_FILE PERMIT_OPEN SSHD_CONFIG SSH_SERVICE CONFIG
 export HOST_KEY_FILE BUNDLE_OUTPUT DRY_RUN BUNDLE_TOKEN_FILE
-export SERVER_STATE TOKEN_PORT LEGACY_SSH BUILD_CLIENT WINDOWS_ARCH
+export SERVER_STATE TOKEN_PORT LEGACY_SSH BUILD_CLIENT WINDOWS_ARCH NO_RESET_TOKEN
 
 .PHONY: help setup server-setup server create delete audit render build build-windows check test integration client bundle bundle-windows client-zip
-.PHONY: docker-config docker-build docker-up docker-down docker-status docker-logs docker-bundle
+.PHONY: docker-config docker-build docker-up docker-down docker-status docker-logs docker-bundle NO_RESET_TOKEN
 
 help:
 	@printf '%s\n' \
@@ -43,6 +47,7 @@ help:
 	  'make render CONFIG=services.json     Preview restricted SSH policy'
 	@printf '%s\n' \
 	  'make docker-up                      Start the Docker server using the existing host SSH port' \
+	  'make docker-up NO_RESET_TOKEN=1     Restart using the saved token; issue one only on first start' \
 	  'make docker-bundle                  Package the running Docker server token and Windows client' \
 	  'make docker-build                   Build the server image and Windows client' \
 	  'make docker-logs                    Follow the Docker server log' \
@@ -109,9 +114,14 @@ docker-build: docker-config
 	$(COMPOSE) build server
 
 docker-up: docker-build
+	$(COMPOSE) stop --timeout 45 server
 	"$(RUN_PYTHON)" server/ssh_bridge.py install --config "$$CONFIG" --sshd-config "$$SSHD_CONFIG" --ssh-service "$$SSH_SERVICE"
 	mkdir -p dist
 	@$(COMPOSE) up -d --force-recreate --wait --wait-timeout 60 server || { $(COMPOSE) logs --no-color --tail 100 server; exit 1; }
+
+# Also accept the shorthand: make docker-up NO_RESET_TOKEN
+NO_RESET_TOKEN:
+	@:
 
 docker-down:
 	$(COMPOSE) down --remove-orphans

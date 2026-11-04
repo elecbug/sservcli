@@ -21,7 +21,10 @@ def run(docker, command):
     options = {"CONFIG": str(Path(os.environ.get("CONFIG") or ROOT / "var/services.windows.json").absolute()),
                "BUILD_CLIENT": os.environ.get("BUILD_CLIENT") or "1",
                "WINDOWS_ARCH": os.environ.get("WINDOWS_ARCH") or "amd64",
+               "NO_RESET_TOKEN": os.environ.get("NO_RESET_TOKEN") or "0",
                "SSERVCLI_BUNDLE_NAME": os.environ.get("SSERVCLI_BUNDLE_NAME") or "sservcli-windows-token.zip"}
+    if options["NO_RESET_TOKEN"] not in ("0", "1"):
+        raise ValueError("NO_RESET_TOKEN must be 0 or 1")
     executable = shlex.split(docker)
     if not executable:
         raise ValueError("DOCKER must specify the Docker command")

@@ -15,9 +15,9 @@ make DOCKER="sudo docker" docker-up
 make DOCKER="sudo docker" docker-bundle
 ```
 
-`docker-up` builds the image and Windows executables, installs/updates a small root-owned host helper, and starts the Docker server in the background. It waits for the server to obtain a working token lease. No separate `make server` process is needed. If your account has Docker access, omit `DOCKER="sudo docker"`; installing the host helper still requires sudo.
+`docker-up` builds the image and Windows executables, stops the previous container, installs/updates a small root-owned host helper, and starts the Docker server in the background. Stopping the previous controller before helper updates prevents an old container from automatically restarting and rotating the token during the update. It waits for the new server to obtain a working token lease. No separate `make server` process is needed. If your account has Docker access, omit `DOCKER="sudo docker"`; installing the host helper still requires sudo.
 
-`docker-bundle` asks the running container to verify its current token against the host account and write **`dist/sservcli-windows-token.zip`**. The minimal download contains the two Windows EXEs, `services.json` with the existing host's public key and actual forwarding username, the current `.token`, start/stop scripts, a short guide, and checksums. Existing downloads receive numeric suffixes. The new ZIP belongs to the invoking host user and has mode 0600.
+`docker-bundle` asks the running container to verify its current token against the host account and write **`dist/sservcli-windows-token.zip`**. The minimal download contains the two Windows EXEs, `services.json` with the existing host's public key and actual forwarding username, the current `.token`, start/stop scripts, a short guide, and checksums. Each successful bundle replaces the existing ZIP at the same path; no numeric suffix is added. The previous download stays intact if ZIP creation or replacement fails. The new ZIP belongs to the invoking host user and has mode 0600.
 
 ```sh
 make DOCKER="sudo docker" docker-status
@@ -25,7 +25,17 @@ make DOCKER="sudo docker" docker-logs
 make DOCKER="sudo docker" docker-down
 ```
 
-Stopping the container revokes its token and closes that dedicated account's forwarding sessions. An abrupt container exit also revokes access through Unix-socket EOF; a paused/unresponsive controller loses its lease after 60 seconds without a heartbeat. Starting or restarting the server issues a fresh token, so create another download with `docker-bundle`. `docker-up` recreates the server to apply configuration and helper updates; it also rotates the token. Host SSH and other SSH accounts continue operating.
+Stopping the container revokes its token and closes that dedicated account's forwarding sessions. An abrupt container exit also revokes access through Unix-socket EOF; a paused/unresponsive controller loses its lease after 60 seconds without a heartbeat. By default, starting or restarting the server issues a fresh token, so create another download with `docker-bundle`. `docker-up` recreates the server to apply configuration and helper updates. Host SSH and other SSH accounts continue operating.
+
+To restart or update the Docker server while retaining the current token:
+
+```sh
+make DOCKER="sudo docker" CONFIG=var/services.windows.json docker-up NO_RESET_TOKEN=1
+# Equivalent shorthand:
+# make DOCKER="sudo docker" CONFIG=var/services.windows.json docker-up NO_RESET_TOKEN
+```
+
+The controller reads private `var/container-server/access.token` from inside the container and the host helper verifies it against the managed account's saved hash before reactivating it. Existing clients can reconnect with the same `.token`; active SSH connections still close during the restart. On the first start, when no token has ever been issued, the option creates one. A missing, corrupt, or mismatched saved token for an existing account stops startup without silently rotating the token. Keep the state directory to retain it. `NO_RESET_TOKEN=0` is the default and rotates the token. The selected option is stored in the container environment and also applies to subsequent Docker/host restarts until the next `docker-up` changes it. Bundling always includes the active token, whether reused or newly issued.
 
 The container communicates with **`sservcli-ssh-bridge.service`** through a private Unix socket. This host helper handles the account/password and SSH policy operations that must affect the host. At installation, it saves an approved account/port list and copies its code into root-owned storage at `/var/lib/sservcli/ssh-bridge`. Requests cannot supply arbitrary commands, files, users, or destination ports. Updating those settings requires rerunning `docker-up` with sudo authorization. The helper starts automatically on host reboot and cleans up stale token access on startup/shutdown. Inspect its errors with:
 
@@ -83,7 +93,7 @@ To package Go sources and the current token without compiling on the server:
 make bundle CONFIG=services.json BUILD_CLIENT=0
 ```
 
-This explicit source-only option includes the Go sources, `Build.cmd`, and supporting documentation. On Windows, install Go and run `Build.cmd` once for that ZIP. This builds both Go executables; it does not use Python, pip, Rust, Node.js, or `gh`. `WINDOWS_ARCH=arm64` selects ARM64 for server-side compilation; the default is `amd64`. Existing ZIPs are preserved with suffixes such as `-2.zip`.
+This explicit source-only option includes the Go sources, `Build.cmd`, and supporting documentation. On Windows, install Go and run `Build.cmd` once for that ZIP. This builds both Go executables; it does not use Python, pip, Rust, Node.js, or `gh`. `WINDOWS_ARCH=arm64` selects ARM64 for server-side compilation; the default is `amd64`. Each successful bundle overwrites the ZIP at the configured destination.
 
 ## Run the client
 
@@ -117,7 +127,7 @@ Launching the EXE without arguments starts the background client and opens manag
 
 An SSH log saying `Authenticated ... using "password"` means the shared token was accepted. The client supplies that password automatically from `.token`. Connection status becomes ready after OpenSSH confirms authentication, all enabled loopback forwarding ports, and session startup. This uses the same lifecycle signals on Windows and Linux. If an address fails before startup completes, its failure is logged before the next address is tried.
 
-After restarting the server, the old token stops working. Regenerate the ZIP with `make docker-bundle` (Docker) or `make bundle` (native host), or replace the client's `.token` with the new token and reconnect. The SSH host key does not change during token rotation.
+After a default server restart, the old token stops working. Regenerate the ZIP with `make docker-bundle` (Docker) or `make bundle` (native host), or replace the client's `.token` with the new token and reconnect. Docker restarts with `NO_RESET_TOKEN=1` retain the saved token, so clients can reconnect using their existing `.token`. The SSH host key does not change during token rotation.
 
 ## Service configuration
 
@@ -164,7 +174,7 @@ Configure 1–64 services with unique IDs and local ports. Local ports are 1024�
 
 ## Server token and account lifecycle
 
-Tokens use Python's `secrets` module and exactly eight characters from `A–Z`, `a–z`, and `0–9`. Each successful controller start issues a fresh token as the dedicated account's SSH password. Native OpenSSH verifies the pinned server key before sending the password through encrypted authentication. Tokens are provided to OpenSSH through a private child environment, never command arguments or logs.
+Tokens use Python's `secrets` module and exactly eight characters from `A–Z`, `a–z`, and `0–9`. By default, each successful controller start issues a fresh token as the dedicated account's SSH password. Docker's `NO_RESET_TOKEN=1` reuses the saved token after checking its hash against the same managed account. Native OpenSSH verifies the pinned server key before sending the password through encrypted authentication. Tokens are provided to OpenSSH through a private child environment, never command arguments or logs. Server-side reuse requests carry the token only through private Unix IPC and a helper control pipe.
 
 Stopping the server controller locks its password and closes that account's existing forwarding sessions. Controller pipe EOF also triggers revocation after a controller crash. Account and controller locks prevent concurrent token rotation. Native OpenSSH/PAM authentication and password policies remain effective, including `MaxAuthTries 3`; the system password policy must permit the requested eight-character format.
 
@@ -180,8 +190,9 @@ The native server token file is `SERVER_STATE/access.token`, default `var/server
 | `SERVER_STATE` | Running controller's private state directory; default `var/server` |
 | `BUILD_CLIENT=0` | Include sources and current token without compiling Windows executables |
 | `WINDOWS_ARCH` | Windows binary architecture: `amd64` (default) or `arm64` |
+| `NO_RESET_TOKEN=1` | Docker server: reactivate the saved token on restart; default `0` issues a fresh token |
 | `BUNDLE_TOKEN_FILE` | Explicit private token source; normal bundle still verifies it against the active server |
-| `BUNDLE_OUTPUT` | ZIP destination; existing downloads receive numeric suffixes |
+| `BUNDLE_OUTPUT` | ZIP destination; successful bundles replace the existing file at this path |
 | `DRY_RUN=1` | Preview bundling without compiling, provisioning, or creating a ZIP |
 | `SSHD_CONFIG` / `SSH_SERVICE` | Existing SSH configuration/service; defaults `/etc/ssh/sshd_config` / `ssh` |
 | `HOST_KEY_FILE` | Public key configured in system sshd; default `/etc/ssh/ssh_host_ed25519_key.pub` |

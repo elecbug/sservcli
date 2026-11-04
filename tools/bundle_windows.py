@@ -82,17 +82,10 @@ def write_archive(output, files, directory):
             stream.writestr(entry, data)
     if ".token" in files:
         archive.chmod(0o600)
-    # Keep previous downloads and handle competing publishers without clobbering.
-    index = 1
-    while True:
-        candidate = output if index == 1 else output.with_name(f"{output.stem}-{index}{output.suffix}")
-        try:
-            os.link(archive, candidate)
-            break
-        except FileExistsError:
-            index += 1
-    archive.unlink()
-    return candidate
+    # The complete archive replaces the previous download atomically. Scratch
+    # space is in output.parent, so publishing stays on the same filesystem.
+    os.replace(archive, output)
+    return output
 
 
 def build_client(args):
@@ -147,7 +140,7 @@ def client_archive(config, inputs, token=None):
                 "Open http://127.0.0.1:8000 for status, service addresses, connect/disconnect, and configuration.\r\n"
                 "Run Stop.cmd or sservcli.exe stop to release all forwards. Closing the browser keeps SSH running.\r\n"
                 "sservcli.exe list shows the service catalog. services.json and .token are read beside the EXE.\r\n"
-                "Keep this ZIP private: .token grants forwarding access. Restarting the server requires a new token/ZIP.\r\n"
+                "Keep this ZIP private: .token grants forwarding access. After server token rotation, replace .token or extract a new ZIP.\r\n"
                 "No private keys or Python files are included.\r\n"
                 + ("See README.md for details.\r\n" if source_only else
                    "Use sservcli.exe help for command-line options.\r\n")).encode()}
@@ -230,7 +223,7 @@ def package(args):
         policy_profile = directory / "server-policy.json"
         policy_profile.write_text(json.dumps(config), encoding="utf-8")
         if args.dry_run:
-            print("Dry run: configuration, public key, and archive inputs validated; would generate missing host keys, start SSH, create/reuse the account, register a missing key for managed accounts, and publish (adding a suffix if the ZIP exists):", output)
+            print("Dry run: configuration, public key, and archive inputs validated; would generate missing host keys, start SSH, create/reuse the account, register a missing key for managed accounts, and publish (replacing the existing ZIP):", output)
             print("Account:", args.user, "Addresses:", [config["ssh"]["host"], *config["ssh"].get("fallback_hosts", [])])
             return None
         try:
@@ -309,7 +302,7 @@ def package_token(args):
     output = (args.output or ROOT / "dist/sservcli-windows-token.zip").absolute()
     if args.dry_run:
         print("Dry run: would create/reuse a restricted OpenSSH password account and pin the existing sshd public host key.")
-        print("Would publish:", output, "(numeric suffix if it exists). The current running token will be included as .token; no new token is issued.")
+        print("Would publish:", output, "(replacing the existing ZIP). The current running token will be included as .token; no new token is issued.")
         return None
     if server is None:
         raise BundleError("Prepare the server account on Ubuntu/OpenSSH; use --client-only to repackage a final client profile elsewhere")

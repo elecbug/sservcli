@@ -14,6 +14,7 @@ services:
     restart: unless-stopped
     stop_grace_period: 45s
     environment:
+      NO_RESET_TOKEN: ${NO_RESET_TOKEN:-0}
       BUILD_CLIENT: ${BUILD_CLIENT:-1}
       WINDOWS_ARCH: ${WINDOWS_ARCH:-amd64}
       BUNDLE_OUTPUT: /dist/${SSERVCLI_BUNDLE_NAME:-sservcli-windows-token.zip}

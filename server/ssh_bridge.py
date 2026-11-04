@@ -18,7 +18,7 @@ import uuid
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 from server import sservcli_server as provision
-from sservcli.config import ConfigError, load_profile, token_profile
+from sservcli.config import ConfigError, load_profile, token_profile, validate_token
 from sservcli.host_bridge import Peer, scope
 
 STATE = Path("/var/lib/sservcli/ssh-bridge")
@@ -110,18 +110,22 @@ class BridgeServer(socketserver.ThreadingUnixStreamServer):
         super().__init__(str(path), BridgeHandler)
         os.chmod(path, 0o600)
 
-    def helper(self, operation):
+    def helper(self, operation, reuse_token=None, *, no_reset_token=False):
         if self.factory:
-            return self.factory(operation)
+            return self.factory(operation, reuse_token, no_reset_token=no_reset_token)
         command = [sys.executable, str(ROOT / "server/sservcli_server.py"), operation,
                    "--config", str(self.state / "profile.json"), "--sshd-config", self.snapshot["sshd_config"],
                    "--ssh-service", self.snapshot["ssh_service"], "--host-key", self.snapshot["host_key"], "--ensure-ssh"]
         if self.snapshot.get("sshd_pid_file"):
             command += ["--sshd-pid-file", self.snapshot["sshd_pid_file"]]
+        if reuse_token is not None:
+            command += ["--reuse-token-stdin"]
+        if no_reset_token or reuse_token is not None:
+            command += ["--no-reset-token"]
         return subprocess.Popen(command, stdin=subprocess.PIPE, stdout=subprocess.PIPE, text=True)
 
-    def launch(self, operation):
-        child = self.helper(operation)
+    def launch(self, operation, reuse_token=None, *, no_reset_token=False):
+        child = self.helper(operation, reuse_token, no_reset_token=no_reset_token)
         with self.lock:
             self.children.add(child)
         return child
@@ -161,14 +165,12 @@ class BridgeServer(socketserver.ThreadingUnixStreamServer):
     def close_clients(self):
         with self.lock:
             self.stopping = True
-            connections, children = list(self.connections), list(self.children)
+            connections = list(self.connections)
         for connection in connections:
             with contextlib.suppress(OSError):
                 connection.shutdown(socket.SHUT_RDWR)
-        for child in children:
-            if child.poll() is None:
-                with contextlib.suppress(ProcessLookupError):
-                    child.terminate()
+        # Handlers close the lifetime pipes and wait for revocation. Sending
+        # SIGTERM here can interrupt a helper already inside its cleanup.
 
 
 class BridgeHandler(socketserver.BaseRequestHandler):
@@ -184,7 +186,10 @@ class BridgeHandler(socketserver.BaseRequestHandler):
         self.request.settimeout(server.request_timeout)
         try:
             request = peer.receive()
-            if set(request) != {"operation", "scope"} or request["scope"] != server.authorized_scope:
+            expected = {"operation", "scope"}
+            if request.get("operation") == "lease" and "reuse_token" in request:
+                expected.add("reuse_token")
+            if set(request) != expected or request["scope"] != server.authorized_scope:
                 raise ConfigError("The requested SSH account/ports differ from the approved host profile; rerun make docker-up")
             operation = request["operation"]
             if operation == "ping":
@@ -201,7 +206,12 @@ class BridgeHandler(socketserver.BaseRequestHandler):
                 leased = server.lease_lock.acquire(blocking=False)
                 if not leased:
                     raise ConfigError("A Docker server already owns the host SSH token lease")
-                child = server.launch("token-serve")
+                reuse_token = validate_token(request["reuse_token"]) if request.get("reuse_token") is not None else None
+                child = server.launch("token-serve", reuse_token, no_reset_token="reuse_token" in request)
+                if reuse_token is not None:
+                    # Keep the credential in the private pipe, never argv/env/logs.
+                    child.stdin.write(json.dumps({"token": reuse_token}) + "\n")
+                    child.stdin.flush()
                 receipt = server.receipt(child)
                 lease_id = uuid.uuid4().hex
                 with server.lock:
@@ -212,6 +222,10 @@ class BridgeHandler(socketserver.BaseRequestHandler):
                     if message == {"operation": "release"}:
                         server.finish(child)
                         child = None
+                        with server.lock:
+                            server.active_id = None
+                        server.lease_lock.release()
+                        leased = False
                         peer.send({"ok": True})
                         break
                     if message != {"operation": "heartbeat"} or child.poll() is not None:

@@ -101,21 +101,41 @@ class BundleTests(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stderr)
 
     def test_late_zip_publish_failure_removes_only_the_new_managed_account(self):
-        with patch.object(bundle.os, "link", side_effect=OSError("fixture publish failure")):
+        with patch.object(bundle.os, "replace", side_effect=OSError("fixture publish failure")):
             with self.assertRaisesRegex(OSError, "publish failure"):
                 bundle.package(self.args)
         self.assertEqual(self.operations, ["ensure", "remove"])
         self.assertFalse(self.args.output.exists())
 
-    def test_existing_output_is_preserved_and_new_archives_receive_a_suffix(self):
+    def test_existing_output_is_replaced_with_the_latest_bundle(self):
         self.args.output.write_text("existing download")
         output = bundle.package(self.args)
-        self.assertEqual(self.args.output.read_text(), "existing download")
-        self.assertEqual(output.name, "client-2.zip")
+        self.assertEqual(output, self.args.output)
         with zipfile.ZipFile(output) as archive:
             self.assertIn("services.json", archive.namelist())
         self.receipt = {"user": "bundle_test", "created": False, "account": "reused", "key": "unchanged"}
-        self.assertEqual(bundle.package(self.args).name, "client-3.zip")
+        self.config["name"] = "Updated profile"
+        self.config_path.write_text(json.dumps(self.config))
+        self.assertEqual(bundle.package(self.args), output)
+        with zipfile.ZipFile(output) as archive:
+            self.assertEqual(json.loads(archive.read("services.json"))["name"], "Updated profile")
+        self.assertEqual(list(self.directory.glob("client-*.zip")), [])
+
+    def test_failed_archive_creation_leaves_the_previous_download_intact(self):
+        self.args.output.write_bytes(b"previous download")
+        with tempfile.TemporaryDirectory(dir=self.directory) as scratch:
+            with patch.object(zipfile.ZipFile, "writestr", side_effect=OSError("fixture ZIP write failure")):
+                with self.assertRaisesRegex(OSError, "ZIP write failure"):
+                    bundle.write_archive(self.args.output, {"services.json": b"new profile"}, scratch)
+        self.assertEqual(self.args.output.read_bytes(), b"previous download")
+
+    def test_failed_archive_replacement_leaves_the_previous_download_intact(self):
+        self.args.output.write_bytes(b"previous download")
+        with tempfile.TemporaryDirectory(dir=self.directory) as scratch:
+            with patch.object(bundle.os, "replace", side_effect=OSError("fixture replacement failure")):
+                with self.assertRaisesRegex(OSError, "replacement failure"):
+                    bundle.write_archive(self.args.output, {"services.json": b"new profile"}, scratch)
+        self.assertEqual(self.args.output.read_bytes(), b"previous download")
 
     def test_invalid_profiles_are_rejected_before_provisioning(self):
         self.config["ssh"]["fallback_hosts"] = ["192.0.2.10"]
@@ -141,7 +161,7 @@ class BundleTests(unittest.TestCase):
         for kind in ("reused", "external"):
             self.operations.clear()
             self.receipt = {"user": "bundle_test", "created": False, "account": kind, "key": "unchanged"}
-            with self.subTest(kind=kind), patch.object(bundle.os, "link", side_effect=OSError("fixture publication failure")):
+            with self.subTest(kind=kind), patch.object(bundle.os, "replace", side_effect=OSError("fixture publication failure")):
                 with self.assertRaisesRegex(OSError, "publication failure"):
                     bundle.package(self.args)
             self.assertEqual(self.operations, ["ensure"])
@@ -260,7 +280,7 @@ class TokenBundleTests(unittest.TestCase):
         first = bundle.package(self.args)
         self.assertEqual(first.stat().st_mode & 0o777, 0o600)
         again = bundle.package(self.args)
-        self.assertEqual(again.name, "client-2.zip")
+        self.assertEqual(again, first)
         self.assertEqual(read_private(self.args.state_dir / "access.token").strip(), secret)
         with zipfile.ZipFile(first) as archive:
             profile = json.loads(archive.read("services.json"))
